@@ -1,0 +1,27 @@
+FROM oven/bun:1.4.2 AS bun
+FROM golang:1.27.3 AS build
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
+ENV GOFLAGS=-buildvcs=false CGO_ENABLED=0
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY web/package.json web/bun.lock ./web/
+RUN cd web && bun install --frozen-lockfile
+COPY . .
+RUN go tool mygo generate && go run ./cmd/godwit-web-types
+RUN cd web && bun run browser:build
+RUN go test ./core/store -run TestOpen -count=1
+RUN go build -trimpath -o /out/godwit-web ./cmd/godwit-web
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* && mkdir /data /keys && chown 1000:1000 /data /keys
+WORKDIR /app
+ENV XDG_CACHE_HOME=/app/runtime-cache
+COPY --from=build --chown=1000:1000 /root/.cache/mygo /app/runtime-cache/mygo
+COPY --from=build --chown=1000:1000 /out/godwit-web /app/godwit-web
+COPY --from=build --chown=1000:1000 /src/web/dist-web /app/web
+USER 1000:1000
+EXPOSE 8787
+HEALTHCHECK --interval=30s --timeout=3s CMD curl -fsS http://127.0.0.1:8787/healthz || exit 1
+ENTRYPOINT ["/app/godwit-web"]
+CMD ["-listen","0.0.0.0:8787","-data-dir","/data","-key-file","/keys/vault.key","-assets","/app/web"]

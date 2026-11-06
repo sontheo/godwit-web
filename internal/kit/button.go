@@ -1,0 +1,215 @@
+package kit
+
+import (
+	"cmp"
+
+	"github.com/egoist/mygo/ui"
+	"github.com/godwit-email/godwit/internal/icons"
+	"github.com/godwit-email/godwit/internal/theme"
+)
+
+// Variant is a button's look.
+type Variant int
+
+const (
+	Default Variant = iota
+	Secondary
+	Outline
+	Ghost
+	Destructive
+	Link
+	DestructiveOutline
+)
+
+// ButtonSize is a button's height; the zero value is the 32 px default.
+type ButtonSize int
+
+const (
+	SizeDefault ButtonSize = iota
+	SizeXs                 // IconButton only, round
+	SizeSm
+	SizeLg
+)
+
+// ButtonOpts style a button. Icon is an icons name shown before the label.
+type ButtonOpts struct {
+	Variant  Variant
+	Size     ButtonSize
+	Disabled bool
+	Flat     bool // Outline without its shadow
+	Icon     string
+}
+
+func button(c *ui.Context, o ButtonOpts, square bool) ui.Element {
+	t, th := theme.Of(c), c.Theme()
+	h, padX := th.Space(8), th.Space(3.5)
+	switch o.Size {
+	case SizeXs:
+		if square { // icon buttons only; a labelled button keeps the default size
+			h, padX = th.Space(4), th.Space(1.5)
+		}
+	case SizeSm:
+		h, padX = th.Space(7), th.Space(2.5)
+	case SizeLg:
+		h, padX = th.Space(9), th.Space(4.5)
+	}
+	// DimDisabled(false) turns off mygo's half-opacity dimming so a disabled
+	// button shows the design's disabled colours instead.
+	b := ui.ButtonBase(c).Disabled(o.Disabled).DimDisabled(false)
+	b.Gap(th.Space(1.5)).Justify(ui.Center).Transition(colors(theme.MotionFast))
+	if o.Variant == Link {
+		b.TextColor(t.Muted)
+		if o.Disabled {
+			b.TextColor(t.Idle)
+		}
+		if o.Size == SizeSm {
+			b.FontSize(t.Text.Sm)
+		}
+		if b.Hovered() && !o.Disabled {
+			b.TextColor(t.Foreground).Underline()
+		}
+		return b
+	}
+	b.Height(h).Radius(t.Radius.Lg)
+	if square {
+		b.Width(h).Radius(t.Radius.Md)
+		if o.Size == SizeXs {
+			b.Radius(t.Radius.Full)
+		}
+	} else {
+		b.PaddingX(padX)
+	}
+	hover := b.Hovered() && !o.Disabled
+	switch o.Variant {
+	case Default:
+		b.Background(t.Primary).TextColor(t.PrimaryText).FontWeight(500)
+		if hover {
+			b.Background(t.Primary.Mix(t.Background, 0.1))
+		}
+	case Secondary:
+		b.Background(t.Hover).TextColor(t.Foreground)
+		if hover {
+			b.Background(t.SidebarSelected)
+		}
+	case Outline:
+		b.Background(t.Background).Border(theme.Stroke, t.Input).TextColor(t.Foreground)
+		if !o.Flat {
+			Elevate(c, b, theme.ShadowXs)
+		}
+		if hover {
+			b.Background(t.Hover)
+		}
+	case Ghost:
+		b.TextColor(t.Foreground)
+		if square {
+			b.TextColor(t.Muted)
+		}
+		if hover {
+			b.Background(t.HoverTint).TextColor(t.Foreground)
+		}
+	case Destructive:
+		b.TextColor(t.Danger)
+		if hover {
+			b.Background(t.DangerBg)
+		}
+	case DestructiveOutline:
+		b.Background(t.Background).Border(theme.Stroke, t.DangerBorder).TextColor(t.Danger)
+		if hover {
+			b.Background(t.DangerBg)
+		}
+	}
+	if o.Disabled {
+		b.TextColor(t.Idle)
+		if o.Variant == Default { // itself at half, as shadcn's opacity-50: a button on any surface, frosted or not
+			b.Background(t.Primary.Alpha(0.5)).TextColor(t.PrimaryText.Alpha(0.5))
+		}
+	}
+	return b
+}
+
+// ButtonFrame is the styled button without children.
+func ButtonFrame(c *ui.Context, o ButtonOpts) ui.Element { return button(c, o, false) }
+
+// Button is a button of a label.
+func Button(c *ui.Context, label string, o ButtonOpts) ui.Element {
+	return button(c, o, false).Label(label).Children(func() {
+		if o.Icon != "" {
+			ui.Icon(c, icons.Get(o.Icon)).Size(theme.Icon, theme.Icon)
+		}
+		ui.Text(c, label)
+	})
+}
+
+// SwapButton is a Button whose label changes in place, as Copy turning
+// into Copied: the old label fades out as the new one fades in. It is as
+// wide as the widest of label and others, the labels it may show, and its
+// content starts at its left edge, so neither it nor its icon moves.
+func SwapButton(c *ui.Context, label string, o ButtonOpts, others ...string) ui.Element {
+	th := c.Theme()
+	content := func(c *ui.Context, text string) ui.Element {
+		return ui.Row(c).Gap(th.Space(1.5)).AlignItems(ui.Center).Children(func() {
+			if o.Icon != "" {
+				ui.Icon(c, icons.Get(o.Icon)).Size(theme.Icon, theme.Icon)
+			}
+			ui.Text(c, text).Role(ui.RoleNone) // the button's Label names it
+		})
+	}
+	return button(c, o, false).Label(label).Children(func() {
+		ui.Column(c).AlignItems(ui.Start).Children(func() {
+			content(c.Key(label), label).
+				Transition(ui.ElementTransition{Duration: theme.MotionBase, Enter: &ui.Motion{}, Exit: &ui.Motion{}}) // a zero Motion is transparent: a fade
+			// Every label, unseen and of no height, widens the column to the widest.
+			for i, l := range append([]string{label}, others...) {
+				content(c.Key(i), l).Height(0).Opacity(0).PassThrough()
+			}
+		})
+	})
+}
+
+// IconButton is a square button showing only an icon, named label for
+// assistive technology and tests. A SizeXs one, 16 round, holds a 12 icon.
+func IconButton(c *ui.Context, icon, label string, o ButtonOpts) ui.Element {
+	b := button(c, o, true).Label(label)
+	tooltip(c, b, label, false)
+	size := float32(theme.Icon)
+	if o.Size == SizeXs {
+		size = theme.IconXs
+	}
+	return b.Children(func() {
+		ui.Icon(c, icons.Get(icon)).Size(size, size)
+	})
+}
+
+// TextLink is an underlined text button of size in color (a notice's action).
+func TextLink(c *ui.Context, label string, color ui.Color, size float32) ui.Element {
+	return ui.ButtonBase(c).Label(label).Children(func() {
+		Text(c, label, size).TextColor(color).Underline()
+	})
+}
+
+// RoundAction is an action named under its icon, as a contact's under their
+// name: the icon in a round tint, then name; tip, if set, is its label and
+// tooltip, saying more than name. On is a state the action turns off, as
+// being blocked.
+func RoundAction(c *ui.Context, icon, name, tip string, disabled, on bool) ui.Element {
+	t, th := theme.Of(c), c.Theme()
+	b := ui.ButtonBase(c).Label(cmp.Or(tip, name)).Width(th.Space(18)).Disabled(disabled)
+	if tip != "" {
+		tooltip(c, b, tip, false)
+	}
+	return b.Children(func() {
+		fg, tint := t.Foreground, t.Hover
+		switch {
+		case disabled:
+			fg = t.Idle
+		case on || b.Hovered():
+			tint = t.Border
+		}
+		ui.Column(c).FillWidth().AlignItems(ui.Center).Gap(th.Space(1.5)).TextColor(fg).Children(func() {
+			ui.Box(c).Size(th.Space(10), th.Space(10)).Radius(t.Radius.Full).Background(tint).Center().Children(func() {
+				ui.Icon(c, icons.Get(icon)).Size(theme.IconMd, theme.IconMd)
+			})
+			Text(c, name, t.Text.Sm).TextAlign(ui.Center)
+		})
+	})
+}

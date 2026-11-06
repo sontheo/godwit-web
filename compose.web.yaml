@@ -1,0 +1,30 @@
+services:
+  mail:
+    image: godwit-web:local
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    command:
+      - -listen
+      - 0.0.0.0:8787
+      - -data-dir
+      - /data
+      - -key-file
+      - /keys/vault.key
+      - -assets
+      - /app/web
+      - -origin
+      - ${GODWIT_ORIGIN:-http://127.0.0.1:8878}
+    ports:
+      - '127.0.0.1:8878:8787'
+    volumes:
+      - mail-data:/data
+      - mail-keys:/keys
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+volumes:
+  mail-data:
+  mail-keys:

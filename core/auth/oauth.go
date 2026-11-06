@@ -1,0 +1,373 @@
+package auth
+
+import (
+	"cmp"
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/godwit-email/godwit/assets"
+	"github.com/godwit-email/godwit/internal/i18n"
+	"golang.org/x/oauth2"
+)
+
+// FlowTimeout bounds an authorization flow from StartFlow to the callback.
+var FlowTimeout = 10 * time.Minute
+
+// Grant is the outcome of an authorization or a refresh. Secrets: never log it.
+// Expiry is never zero: without expires_in it is 30 minutes after receipt.
+type Grant struct {
+	Email, RefreshToken, AccessToken string
+	Expiry                           time.Time
+	ClientID, Scope                  string // ClientID is only set for DynamicClient flows
+}
+
+// Flow is one authorization-code flow with PKCE, waiting for the browser on a
+// loopback listener.
+type Flow struct {
+	ocfg     OAuthConfig
+	cfg      oauth2.Config
+	hc       *http.Client
+	verifier string
+	state    string
+	authURL  string
+	ln       net.Listener
+	srv      *http.Server
+	ctx      context.Context // ends on Close or after FlowTimeout; bounds the token exchange
+	cancel   context.CancelFunc
+	claimed  atomic.Bool // a callback with the right state arrived
+
+	finishOnce sync.Once
+	done       chan struct{}
+	grant      Grant
+	err        error
+
+	closeOnce sync.Once
+}
+
+func config(cfg OAuthConfig) oauth2.Config {
+	return oauth2.Config{ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret, Scopes: cfg.Scopes,
+		Endpoint: oauth2.Endpoint{AuthURL: cfg.AuthURL, TokenURL: cfg.TokenURL, AuthStyle: oauth2.AuthStyleInParams}}
+}
+
+func withClient(ctx context.Context, hc *http.Client) context.Context {
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	return context.WithValue(ctx, oauth2.HTTPClient, hc)
+}
+
+// StartFlow listens on 127.0.0.1 for the redirect and builds the authorization
+// URL. The listener closes when the flow ends: callback handled, Wait's ctx
+// done, FlowTimeout passed or Close.
+func StartFlow(cfg OAuthConfig, loginHint string, hc *http.Client) (*Flow, error) {
+	if cfg.ClientID == "" {
+		return nil, ErrOAuthNotConfigured
+	}
+	var ln net.Listener
+	var err error
+	if cfg.RedirectURL == "" {
+		ln, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.RedirectPort))
+		if err != nil {
+			if cfg.RedirectPort != 0 {
+				return nil, fmt.Errorf("%w: %d", ErrRedirectPortBusy, cfg.RedirectPort)
+			}
+			return nil, err
+		}
+	}
+	state := make([]byte, 32)
+	rand.Read(state)
+	host := cmp.Or(cfg.RedirectHost, "localhost")
+	path := cmp.Or(cfg.RedirectPath, "/callback")
+	f := &Flow{ocfg: cfg, cfg: config(cfg), hc: hc, verifier: oauth2.GenerateVerifier(),
+		state: base64.RawURLEncoding.EncodeToString(state), done: make(chan struct{})}
+	f.cfg.RedirectURL = cfg.RedirectURL
+	if ln != nil {
+		f.cfg.RedirectURL = fmt.Sprintf("http://%s:%d%s", host, ln.Addr().(*net.TCPAddr).Port, path)
+	}
+	opts := []oauth2.AuthCodeOption{oauth2.S256ChallengeOption(f.verifier)}
+	if !cfg.NoPrompt {
+		opts = append(opts, oauth2.SetAuthURLParam("prompt", "select_account"))
+	}
+	if cfg.Nonce {
+		nonce := make([]byte, 32)
+		rand.Read(nonce)
+		opts = append(opts, oauth2.SetAuthURLParam("nonce", base64.RawURLEncoding.EncodeToString(nonce)))
+	}
+	for k, v := range cfg.AuthParams {
+		opts = append(opts, oauth2.SetAuthURLParam(k, v))
+	}
+	if loginHint != "" {
+		opts = append(opts, oauth2.SetAuthURLParam("login_hint", loginHint))
+	}
+	f.authURL = f.cfg.AuthCodeURL(f.state, opts...)
+	f.ctx, f.cancel = context.WithTimeout(context.Background(), FlowTimeout)
+	mux := http.NewServeMux()
+	mux.HandleFunc(path, f.callback)
+	f.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	f.ln = ln
+	if ln != nil {
+		go f.srv.Serve(ln)
+	}
+	// Registered last: it may run Close, which reads every field.
+	context.AfterFunc(f.ctx, func() { f.finish(Grant{}, ErrFlowExpired); f.Close() })
+	return f, nil
+}
+
+// AuthURL is the address to open in the user's browser.
+func (f *Flow) AuthURL() string { return f.authURL }
+
+// Wait returns the grant once the browser came back and the code was exchanged,
+// or the flow's error. The listener is closed when it returns.
+func (f *Flow) Wait(ctx context.Context) (Grant, error) {
+	select {
+	case <-f.done:
+	case <-ctx.Done():
+		f.finish(Grant{}, ctx.Err())
+	}
+	f.Close()
+	return f.grant, f.err
+}
+
+// Close ends the flow (a pending Wait returns context.Canceled) and releases the listener.
+func (f *Flow) Close() {
+	f.finish(Grant{}, context.Canceled)
+	f.closeOnce.Do(func() {
+		f.cancel()
+		if f.ln != nil {
+			f.ln.Close()
+		} // a web host has no private listener
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if f.srv.Shutdown(ctx) != nil { // the listener is closed either way; this only waits for the page
+			f.srv.Close()
+		}
+	})
+}
+
+func (f *Flow) finish(g Grant, err error) {
+	f.finishOnce.Do(func() { f.grant, f.err = g, err; close(f.done) })
+}
+
+// pageHead drops the code and state from the address bar once the page is shown.
+// Colors copy web/src/shared/styles.css; this page is served outside the app.
+const pageHead = `<!doctype html><html lang="%s"><meta charset="utf-8"><meta name="viewport" content="width=device-width">` +
+	`<meta name="color-scheme" content="light dark"><title>Godwit</title><style>` +
+	`:root{--bg:oklch(1 0 0);--fg:oklch(.145 0 0);--muted:oklch(.556 0 0)}` +
+	`@media (prefers-color-scheme:dark){:root{--bg:oklch(.145 0 0);--fg:oklch(.985 0 0);--muted:oklch(.708 0 0)}}` +
+	`body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,sans-serif;text-align:center}` +
+	`svg{width:96px;height:96px;margin:-24px 0}h1{margin:16px 0 4px;font-size:20px;font-weight:600}p{margin:0;color:var(--muted)}` +
+	`</style><script>history.replaceState(null, "", "/")</script><main>`
+
+// callbackPage is the page for ok or not, in the app's language.
+func callbackPage(ok bool) string {
+	k := "oauth.page.fail"
+	if ok {
+		k = "oauth.page.ok"
+	}
+	return fmt.Sprintf(pageHead, i18n.Language()) + string(assets.Logo) +
+		"<h1>" + i18n.T(k+".title") + "</h1><p>" + i18n.T(k+".body") + "</p></main></html>"
+}
+
+// callback answers the browser with a fixed page that echoes nothing. A request
+// without the flow's state is refused and the flow keeps waiting.
+func (f *Flow) callback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet { // HEAD too: a prefetch must not spend the code
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	if subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(f.state)) != 1 || !f.claimed.CompareAndSwap(false, true) {
+		page(w, false)
+		return
+	}
+	g, err := f.exchange(q)
+	page(w, err == nil)
+	f.finish(g, err)
+	go f.Close() // release the port now, Wait or not; Close waits for this handler to return
+}
+
+func page(w http.ResponseWriter, ok bool) {
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Cache-Control", "no-store")
+	h.Set("Referrer-Policy", "no-referrer")
+	if ok {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusBadRequest)
+	}
+	fmt.Fprint(w, callbackPage(ok))
+}
+
+func (f *Flow) exchange(q url.Values) (Grant, error) {
+	switch e := q.Get("error"); e {
+	case "":
+	case "access_denied":
+		return Grant{}, ErrAccessDenied
+	default:
+		return Grant{}, fmt.Errorf("oauth: authorization refused: %s", errorCode(e))
+	}
+	code := q.Get("code")
+	if code == "" {
+		return Grant{}, errors.New("oauth: the callback carried no authorization code")
+	}
+	clientID := q.Get("client_id")
+	if f.ocfg.DynamicClient && clientID == "" {
+		return Grant{}, errors.New("oauth: the callback named no client ID")
+	}
+	cfg := f.cfg
+	if f.ocfg.DynamicClient {
+		cfg.ClientID = clientID
+	}
+	opts := []oauth2.AuthCodeOption{oauth2.VerifierOption(f.verifier)}
+	for k, v := range f.ocfg.TokenParams {
+		opts = append(opts, oauth2.SetAuthURLParam(k, v))
+	}
+	tok, err := cfg.Exchange(withClient(f.ctx, f.hc), code, opts...)
+	if err != nil {
+		return Grant{}, tokenError(err)
+	}
+	g := grantFrom(tok)
+	if f.ocfg.DynamicClient {
+		g.ClientID = clientID
+	}
+	if f.ocfg.RequireScope != "" && !slices.Contains(strings.Fields(g.Scope), f.ocfg.RequireScope) {
+		return Grant{}, ErrScopeMissing
+	}
+	if g.Email == "" {
+		return Grant{}, errors.New("oauth: the token response named no email address")
+	}
+	return g, nil
+}
+
+// Refresh trades refreshToken for a new access token. Grant.RefreshToken is ""
+// unless the server rotated it; Grant.Email is "" without an id_token.
+func Refresh(ctx context.Context, cfg OAuthConfig, hc *http.Client, refreshToken string) (Grant, error) {
+	if cfg.ClientID == "" {
+		return Grant{}, ErrOAuthNotConfigured
+	}
+	c := config(cfg)
+	tok, err := c.TokenSource(withClient(ctx, hc), &oauth2.Token{RefreshToken: refreshToken}).Token()
+	if err != nil {
+		return Grant{}, tokenError(err)
+	}
+	g := grantFrom(tok)
+	if g.RefreshToken == refreshToken { // x/oauth2 fills in the old one when none came back
+		g.RefreshToken = ""
+	}
+	return g, nil
+}
+
+// noExpiryTTL is how long an access token whose response gave no expires_in is
+// trusted, counted from its receipt.
+const noExpiryTTL = 30 * time.Minute
+
+func grantFrom(tok *oauth2.Token) Grant {
+	g := Grant{AccessToken: tok.AccessToken, RefreshToken: tok.RefreshToken, Expiry: tok.Expiry}
+	if g.Expiry.IsZero() {
+		g.Expiry = time.Now().Add(noExpiryTTL)
+	}
+	if id, ok := tok.Extra("id_token").(string); ok {
+		g.Email = emailFromIDToken(id)
+	}
+	if sc, ok := tok.Extra("scope").(string); ok {
+		g.Scope = sc
+	}
+	return g
+}
+
+// emailFromIDToken reads email, else preferred_username, from the JWT payload.
+// The token came straight from the token endpoint over TLS, so it is not verified.
+func emailFromIDToken(idToken string) string {
+	parts := strings.Split(idToken, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return ""
+	}
+	var c struct {
+		Email             string `json:"email"`
+		PreferredUsername string `json:"preferred_username"`
+	}
+	if json.Unmarshal(b, &c) != nil {
+		return ""
+	}
+	if c.Email == "" {
+		c.Email = c.PreferredUsername
+	}
+	return strings.ToLower(strings.TrimSpace(c.Email))
+}
+
+// tokenMessages are the fixed texts for token endpoint error codes. Nothing from
+// the response body reaches an error: it may echo the code, a token or the verifier.
+var tokenMessages = map[string]string{
+	"invalid_request":     "oauth: the token endpoint rejected the request (invalid_request)",
+	"unauthorized_client": "oauth: this client may not use this grant (unauthorized_client)",
+	"invalid_scope":       "oauth: the token endpoint rejected the scopes (invalid_scope)",
+}
+
+var errBadTokenResponse = errors.New("oauth: the token endpoint returned an invalid response")
+
+// tokenError maps x/oauth2's errors, which quote the response body, to fixed ones.
+// Context cancellation and deadlines still match with errors.Is.
+func tokenError(err error) error {
+	var re *oauth2.RetrieveError
+	switch {
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("oauth: token request: %w", context.Canceled)
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("oauth: token request: %w", context.DeadlineExceeded)
+	case errors.As(err, &re):
+		return tokenCodeError(re.ErrorCode)
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) { // transport failure: the request never got an answer
+		return errors.New("oauth: could not reach the token endpoint")
+	}
+	return errBadTokenResponse
+}
+
+func tokenCodeError(code string) error {
+	switch code {
+	case "invalid_grant":
+		return ErrInvalidGrant
+	case "invalid_client":
+		return ErrInvalidClient
+	case "access_denied":
+		return ErrAccessDenied
+	}
+	if m, ok := tokenMessages[code]; ok {
+		return errors.New(m)
+	}
+	return errBadTokenResponse
+}
+
+// errorCode keeps an OAuth error code printable and short: it comes from the network.
+func errorCode(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, s)
+	return s[:min(len(s), 64)]
+}
+
+// ServeHTTP handles the state- and PKCE-protected web callback.
+func (f *Flow) ServeHTTP(w http.ResponseWriter, r *http.Request) { f.callback(w, r) }

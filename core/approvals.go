@@ -1,0 +1,579 @@
+package core
+
+import (
+	"cmp"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"time"
+
+	"github.com/egoist/mygo/plugins/sqlite"
+	"github.com/godwit-email/godwit/core/ai"
+	"github.com/godwit-email/godwit/core/events"
+	"github.com/godwit-email/godwit/core/gateway"
+	"github.com/godwit-email/godwit/core/mail"
+	"github.com/godwit-email/godwit/core/store"
+)
+
+// prepared is a call's final arguments, fixed before the approval is
+// recorded. The Service fills Binding and the tool's source, and adds the
+// tool's Egress to the Destinations Prepare named.
+type prepared struct {
+	Args                    json.RawMessage
+	Summary, TargetKind     string
+	TargetID, TargetVersion int64
+	Destinations            []string        // host[:port] the call sends to
+	Binding                 string          // toolDesc.Binding when proposed
+	Input                   json.RawMessage // an MCP call's form (mcpInput), if it asked one
+	source, extension       string
+}
+
+// executor runs a write tool's approved calls.
+type executor struct {
+	// Prepare turns the model's arguments into the final ones before the
+	// approval is recorded: the default account resolved to an explicit ID,
+	// HTML sanitized, the conversation's draft ID and current revision bound.
+	// A call it fails goes back to the model as an error, with no approval.
+	Prepare func(ctx context.Context, conv Conversation, args json.RawMessage) (prepared, error)
+	// Apply makes the statements for an approval from its recorded arguments
+	// only, without committing them; result goes to the model, undo is stored.
+	Apply func(ctx context.Context, a Approval) (stmts []sqlite.Statement, result, undo any, err error)
+}
+
+// Approval is a call waiting for the user or decided. State goes
+// pending → executing → done or failed, or pending → rejected or stale. Error
+// is what the model was told for any end state but done. Destinations are
+// the hosts (host[:port]) the call sends data to, if any. CallID is the
+// tool call it answers ("skill" for a skill's proposal).
+type Approval struct {
+	ID, RunID, ConversationID int64
+	Seq                       int
+	CallID, Tool              string
+	Args                      json.RawMessage
+	Summary, State, Error     string
+	Destinations              []string
+	// SessionAllow: 本次对话都允许 can approve it (ResolveApprovalForConversation).
+	SessionAllow bool
+	// DraftID is the draft it made (an allowed create_draft), while that
+	// draft exists: 0 once it is sent or deleted.
+	DraftID int64
+	// DraftEdit: it edits the draft of its conversation (update_draft,
+	// update_selection), which the compose window shows in place.
+	DraftEdit bool
+	// Form is the form an MCP server asks the user to fill (formView JSON),
+	// nil for none: AnswerQuestion answers it.
+	Form json.RawMessage
+}
+
+// ErrNotGrantable: the approval's tool cannot be allowed for the whole conversation.
+var ErrNotGrantable = errors.New("this tool cannot be allowed for the whole conversation")
+
+// sessionTools are the tools 本次对话都允许 can grant: built-in ones that
+// write only locally, with no destinations. Never an external (plugin or
+// MCP) tool, and never a send: no tool sends. A grant is keyed by
+// conversation, tool and extension binding (empty for built-ins), not by
+// model: it still holds after the conversation switches models.
+var sessionTools = []string{"create_draft"}
+
+// decisionSession is the audit decision of a call a session grant approved.
+const decisionSession = "auto:session"
+
+// grantKey is a session grant: a tool, as bound, in one conversation. Grants
+// live in memory (本次): they end with the app or the conversation.
+type grantKey struct {
+	conv          int64
+	tool, binding string
+}
+
+func sessionGrantable(a approvalRow) bool {
+	return slices.Contains(sessionTools, a.Tool) && a.source == gateway.SourceWit && len(a.Destinations) == 0
+}
+
+func (a approvalRow) grant() grantKey {
+	return grantKey{conv: a.ConversationID, tool: a.Tool, binding: a.binding}
+}
+
+// granted reports whether a session grant approves pending approval id.
+func (s *Service) granted(ctx context.Context, id int64) bool {
+	a, err := s.approvalRow(ctx, id)
+	if err != nil || !sessionGrantable(a) {
+		return false
+	}
+	_, ok := s.sessionGrants.Load(a.grant())
+	return ok
+}
+
+// dropGrants ends conversation conv's session grants and returns them.
+func (s *Service) dropGrants(conv int64) []grantKey {
+	var out []grantKey
+	s.sessionGrants.Range(func(k, _ any) bool {
+		if g := k.(grantKey); g.conv == conv {
+			s.sessionGrants.Delete(k)
+			out = append(out, g)
+		}
+		return true
+	})
+	return out
+}
+
+// setGrantsAside drops conversation conv's grants for runID, a question
+// asked again (asked again, a write waits for the user), till putGrantsBack
+// or forgetGrants settles them.
+func (s *Service) setGrantsAside(conv, runID int64) {
+	s.setAside.Store(runID, s.dropGrants(conv))
+}
+
+// putGrantsBack restores what runID set aside: it replaced nothing.
+func (s *Service) putGrantsBack(runID int64) {
+	if v, ok := s.setAside.LoadAndDelete(runID); ok {
+		for _, g := range v.([]grantKey) {
+			s.sessionGrants.Store(g, true)
+		}
+	}
+}
+
+// forgetGrants drops what runID set aside: it replaced what they were for.
+func (s *Service) forgetGrants(runID int64) { s.setAside.Delete(runID) }
+
+// ResolveApprovalForConversation accepts pending approval id and allows its
+// tool for the rest of its conversation (本次对话都允许): the run's other
+// pending calls of the tool are accepted too, and later ones as soon as they
+// come (applyInitial), audited auto:session. The tool and the conversation
+// come from the approval. Only sessionTools qualify, else ErrNotGrantable.
+func (s *Service) ResolveApprovalForConversation(ctx context.Context, id int64) error {
+	ctx, end, err := s.begin(ctx, 0)
+	if err != nil {
+		return err
+	}
+	defer end()
+	a, err := s.approvalRow(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !sessionGrantable(a) {
+		return ErrNotGrantable
+	}
+	if a.State != "pending" {
+		return ErrInvalidState
+	}
+	// Granted before the decision: the run it resumes may call the tool again at once.
+	// A click that loses to another leaves the grant unless the approval
+	// ended rejected: on a double click the winner, which found the grant
+	// stored, relies on it.
+	_, had := s.sessionGrants.LoadOrStore(a.grant(), true)
+	if err := s.decide(ctx, id, true, nil, true); err != nil {
+		if errors.Is(err, ErrInvalidState) && !had {
+			if cur, rerr := s.approvalRow(ctx, id); rerr != nil || cur.State == "rejected" {
+				s.sessionGrants.Delete(a.grant())
+			}
+		}
+		return s.cleanError(err)
+	}
+	others, err := s.approvalRows(ctx, "a.run_id = ? AND a.state = 'pending' AND a.tool = ?", a.RunID, a.Tool)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, o := range others {
+		if sessionGrantable(o) && o.grant() == a.grant() {
+			if err := s.decideAs(ctx, o.ID, true, nil, true, decisionSession); !errors.Is(err, ErrInvalidState) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return s.cleanError(errors.Join(errs...))
+}
+
+// ErrStaleApproval: what an external approval was bound to (plugin code,
+// permissions or config; an MCP server or tool definition) changed since it
+// was proposed; it was not run.
+var ErrStaleApproval = errors.New("the tool changed since this was proposed")
+
+// What the model is told for an approval that did not run.
+const (
+	msgRejected  = "rejected by the user"
+	msgStale     = "the target changed after this was proposed"
+	msgCancelled = "cancelled"
+	msgQuit      = "the app quit before this finished"
+	msgNotSaved  = "the change could not be saved"
+	msgRecovery  = "recovery failed"
+	msgUncertain = "the result is uncertain: it may have run"
+)
+
+// Test hook, nil in production: beforeFollowRead runs in FollowConversation
+// once it subscribed and before it reads the conversation.
+var beforeFollowRead func()
+
+// approvalRow is an approval with the columns only the Service uses.
+type approvalRow struct {
+	Approval
+	result, targetKind         string
+	targetID, targetVersion    int64
+	binding, source, extension string
+	label                      string // the extension's name, for an MCP server too (else extension)
+	input                      string // mcpInput JSON, "" for none
+}
+
+// auditRow is the audit_log row of the approval's decision.
+func (s *Service) auditRow(a approvalRow, decision string) sqlite.Statement {
+	return gateway.Audit(gateway.Entry{Source: a.source, Extension: a.extension, Tool: a.Tool, CallID: a.CallID,
+		TargetKind: a.targetKind, TargetID: a.targetID, Destinations: a.Destinations, Decision: decision}, s.secrets.Redact)
+}
+
+// gateway is the Service's gateway: its audit rows are redacted.
+func (s *Service) gateway() *gateway.Gateway { return gateway.New(s.db, s.secrets.Redact) }
+
+// toolResult is the approval's outcome as the model gets it. A plugin or
+// MCP tool's outcome of any kind is wrapped (as "<source>:<name>"); a done
+// result that is a JSON string is wrapped as its text.
+func (a approvalRow) toolResult() ai.ToolResult {
+	r := ai.ToolResult{CallID: a.CallID, Name: a.Tool}
+	if a.source == gateway.SourcePlugin || a.source == gateway.SourceMCP {
+		wrap := func(text string) string {
+			return ai.Untrusted(a.source+":"+cmp.Or(a.label, a.extension), text, ai.SuspectInjection(text))
+		}
+		text := a.result
+		if a.State != "done" {
+			r.Error = wrap(text)
+			return r
+		}
+		var str string
+		if len(text) > 0 && text[0] == '"' && json.Unmarshal([]byte(text), &str) == nil { // null and the rest stay JSON
+			text = str
+		}
+		r.Output, _ = json.Marshal(wrap(text))
+		return r
+	}
+	if a.State == "done" {
+		r.Output = json.RawMessage(a.result)
+	} else {
+		r.Error = a.result
+	}
+	return r
+}
+
+func (s *Service) approvalRows(ctx context.Context, where string, args ...any) ([]approvalRow, error) {
+	rows, err := s.db.Query(ctx, `SELECT a.id, a.run_id, r.conversation_id, a.seq, a.tool, a.args, a.summary, a.state, a.result,
+		a.call_id, a.target_kind, a.target_id, a.target_version, a.destinations, a.binding, a.source, a.extension,
+		CASE a.source WHEN 'mcp' THEN (SELECT name FROM mcp_servers WHERE id = CAST(a.extension AS INTEGER)) END,
+		(SELECT MAX(id) FROM drafts WHERE ai_approval_id = a.id), a.input
+		FROM approvals a JOIN runs r ON r.id = a.run_id
+		WHERE `+where+" ORDER BY a.run_id, a.seq", args...)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]approvalRow, 0, len(rows.Values))
+	for _, r := range rows.Values {
+		a := approvalRow{Approval: Approval{ID: store.Int(r[0]), RunID: store.Int(r[1]), ConversationID: store.Int(r[2]),
+			Seq: int(store.Int(r[3])), CallID: store.Str(r[9]), Tool: store.Str(r[4]), Args: json.RawMessage(store.Str(r[5])), Summary: store.Str(r[6]),
+			State: store.Str(r[7])}, result: store.Str(r[8]), targetKind: store.Str(r[10]),
+			targetID: store.Int(r[11]), targetVersion: store.Int(r[12]), binding: store.Str(r[14]), source: store.Str(r[15]),
+			extension: store.Str(r[16]), label: store.Str(r[17]), input: store.Str(r[19])}
+		a.DraftID, a.Form = store.Int(r[18]), a.form()
+		if err := json.Unmarshal([]byte(store.Str(r[13])), &a.Destinations); err != nil {
+			return nil, err
+		}
+		if a.State != "done" {
+			a.Error = a.result
+		}
+		a.SessionAllow, a.DraftEdit = sessionGrantable(a), isDraftEdit(a.Tool)
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+func (s *Service) approvals(ctx context.Context, where string, args ...any) ([]Approval, error) {
+	rows, err := s.approvalRows(ctx, where, args...)
+	out := make([]Approval, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Approval)
+	}
+	return out, err
+}
+
+func (s *Service) approvalRow(ctx context.Context, id int64) (approvalRow, error) {
+	as, err := s.approvalRows(ctx, "a.id = ?", id)
+	if err != nil {
+		return approvalRow{}, err
+	}
+	if len(as) == 0 {
+		return approvalRow{}, fmt.Errorf("approval %d not found", id)
+	}
+	return as[0], nil
+}
+
+func (s *Service) getApproval(ctx context.Context, id int64) (Approval, error) {
+	a, err := s.approvalRow(ctx, id)
+	return a.Approval, err
+}
+
+// ListApprovals returns the conversation's approvals by run and seq, so the
+// cards survive a restart.
+func (s *Service) ListApprovals(ctx context.Context, conversationID int64) ([]Approval, error) {
+	ctx, end, err := s.begin(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer end()
+	return s.approvals(ctx, "r.conversation_id = ?", conversationID)
+}
+
+// ResolveApproval accepts or rejects a pending approval, exactly once: the
+// call that claims it (pending → executing) decides it; any other gets
+// ErrInvalidState. Accepting applies the recorded arguments and marks it done
+// in one transaction, after checking the target draft's revision (changed →
+// stale, ErrStaleDraft). An external tool's approval runs outside the lock
+// instead and records its outcome afterwards (see decideExternal; a changed
+// binding makes it stale, ErrStaleApproval). The call that ends the run's last
+// open approval resumes the run in the background; SubscribeConversation streams it.
+func (s *Service) ResolveApproval(ctx context.Context, id int64, accept bool) error {
+	ctx, end, err := s.begin(ctx, 0)
+	if err != nil {
+		return err
+	}
+	defer end()
+	return s.cleanError(s.resolveApproval(ctx, id, accept))
+}
+
+// ResolveApprovalWithArgs accepts or rejects pending approval id with edited arguments args.
+func (s *Service) ResolveApprovalWithArgs(ctx context.Context, id int64, accept bool, args json.RawMessage) error {
+	ctx, end, err := s.begin(ctx, 0)
+	if err != nil {
+		return err
+	}
+	defer end()
+	return s.cleanError(s.decide(ctx, id, accept, args, true))
+}
+
+func (s *Service) resolveApproval(ctx context.Context, id int64, accept bool) error {
+	return s.decide(ctx, id, accept, nil, true)
+}
+
+// decide claims and ends a pending approval. Accepted, it applies args when
+// set (an edited proposal) instead of the recorded arguments. With resume
+// false the caller resumes the run (runLedger.resume) afterwards.
+func (s *Service) decide(ctx context.Context, id int64, accept bool, args json.RawMessage, resume bool) error {
+	return s.decideAs(ctx, id, accept, args, resume, "executed")
+}
+
+// decideAs is decide auditing an accepted call that is applied as decision.
+func (s *Service) decideAs(ctx context.Context, id int64, accept bool, args json.RawMessage, resume bool, decision string) error {
+	a, err := s.approvalRow(ctx, id)
+	if err != nil {
+		return err
+	}
+	if accept && args == nil && (a.Tool == askQuestionTool || a.unanswered()) {
+		return ErrNeedsAnswer
+	}
+	var ex *executor
+	if accept {
+		d, ok := s.desc(a.Tool)
+		switch {
+		case ok && d.Mode == modeExternal && d.Run != nil && args == nil:
+			return s.decideExternal(ctx, a, d, resume)
+		case ok && d.Mode != modeExternal && d.Exec != nil:
+			ex = d.Exec
+		case !ok && a.binding != "": // its extension is gone: what it was bound to changed
+			return s.decideExternal(ctx, a, toolDesc{Binding: func(context.Context) (string, error) { return "", ErrStaleApproval }}, resume)
+		default:
+			return fmt.Errorf("tool %s is not available", a.Tool)
+		}
+	}
+	if accept && a.Tool == proposeRuleTool { // before the claim: unconfirmed, it stays pending
+		if args, err = confirmedRuleArgs(a.Args, args); err != nil {
+			return err
+		}
+	}
+	if accept && args != nil && (a.Tool == "create_draft" || a.Tool == "reply_to_mail" || a.Tool == "forward_mail") {
+		if args, err = s.editedDraftArgs(ctx, a.Args, args); err != nil {
+			return err
+		}
+	}
+	return s.ledger.execute(ctx, id, a.RunID, func(ctx context.Context) error {
+		start := time.Now()
+		err := s.execute(ctx, a, ex, args, decision)
+		s.worked(ctx, a.RunID, start)
+		s.bus.Publish(events.Event{Type: events.ApprovalsChanged, ConversationID: a.ConversationID})
+		return err
+	}, resume)
+}
+
+// editedDraftArgs is a draft proposal's recorded arguments with the user's
+// edit from the approval card: its subject, and its body as plain text in
+// place of the recorded editable part. The recorded quote and signature stay.
+func (s *Service) editedDraftArgs(ctx context.Context, recorded, edited json.RawMessage) (json.RawMessage, error) {
+	var rec map[string]json.RawMessage
+	var ed struct {
+		Subject *string `json:"subject"`
+		HTML    *string `json:"html"`
+	}
+	if err := json.Unmarshal(recorded, &rec); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(edited, &ed); err != nil {
+		return nil, err
+	}
+	if ed.Subject != nil {
+		rec["subject"], _ = json.Marshal(*ed.Subject)
+	}
+	if ed.HTML != nil {
+		var old string
+		_ = json.Unmarshal(rec["html"], &old)
+		_, quote, sig := mail.SplitDraft(old)
+		h, err := s.sanitizeDraft(ctx, mail.JoinDraft(textHTML(*ed.HTML), quote, sig))
+		if err != nil {
+			return nil, err
+		}
+		rec["html"], _ = json.Marshal(h)
+	}
+	return json.Marshal(rec)
+}
+
+// execute ends a claimed approval: rejected when ex is nil, else applied with
+// args, if set, in place of the recorded arguments (which done then records),
+// audited as decision.
+func (s *Service) execute(ctx context.Context, a approvalRow, ex *executor, args json.RawMessage, decision string) error {
+	var edited any // NULL keeps the recorded arguments
+	finish := func(state, result string, undo any, decision string, stmts ...sqlite.Statement) error {
+		if state != "done" {
+			edited = nil
+		}
+		return s.ledger.finish(ctx, a, state, result, edited, undo, decision, stmts...)
+	}
+	if ex == nil {
+		if a.Tool == askQuestionTool || a.input != "" {
+			return finish("rejected", msgUnanswered, nil, "rejected")
+		}
+		return finish("rejected", msgRejected, nil, "rejected")
+	}
+	if args != nil {
+		a.Args, edited = args, string(args)
+	}
+	stmts, result, undo, err := ex.Apply(ctx, a.Approval)
+	var res, und []byte
+	if err == nil {
+		res, err = json.Marshal(result)
+	}
+	if err == nil && undo != nil {
+		und, err = json.Marshal(undo)
+	}
+	if err != nil {
+		return errors.Join(err, finish("failed", err.Error(), nil, "failed"))
+	}
+	var undoText any // NULL without undo
+	if und != nil {
+		undoText = string(und)
+	}
+	if a.targetKind == "draft" {
+		// Every draft write holds editMu, so the revision read here holds until
+		// the commit; the guard statement checks it again inside the transaction.
+		s.editMu.Lock()
+		defer s.editMu.Unlock()
+		// A draft in the outbox is read-only: as stale as a changed one.
+		rows, err := s.db.Query(ctx, `SELECT 1 FROM drafts WHERE id = ? AND revision = ?
+			AND NOT EXISTS (SELECT 1 FROM outbox WHERE draft_id = drafts.id)`, a.targetID, a.targetVersion)
+		if err != nil {
+			return errors.Join(err, finish("failed", msgNotSaved, nil, "failed"))
+		}
+		if len(rows.Values) == 0 {
+			return errors.Join(ErrStaleDraft, finish("stale", msgStale, nil, "stale"))
+		}
+		// approvals.state is NOT NULL: a changed revision fails the transaction.
+		stmts = append([]sqlite.Statement{{SQL: "UPDATE approvals SET state = NULL WHERE id = ? AND (SELECT revision FROM drafts WHERE id = ?) IS NOT ?",
+			Args: []any{a.ID, a.targetID, a.targetVersion}}}, stmts...)
+	}
+	if err := finish("done", string(res), undoText, decision, stmts...); err != nil {
+		return errors.Join(err, finish("failed", msgNotSaved, nil, "failed"))
+	}
+	return nil
+}
+
+// ResolveAll resolves the run's pending approvals one by one in seq order;
+// accepting leaves its questions pending: only AnswerQuestion accepts them.
+func (s *Service) ResolveAll(ctx context.Context, runID int64, accept bool) error {
+	ctx, end, err := s.begin(ctx, 0)
+	if err != nil {
+		return err
+	}
+	defer end()
+	return s.cleanError(s.resolveAll(ctx, runID, accept))
+}
+
+func (s *Service) resolveAll(ctx context.Context, runID int64, accept bool) error {
+	as, err := s.approvalRows(ctx, "a.run_id = ? AND a.state = 'pending'", runID)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, a := range as {
+		if accept && (a.Tool == askQuestionTool || a.input != "") { // only the user's answers accept it
+			continue
+		}
+		if err := s.resolveApproval(ctx, a.ID, accept); !errors.Is(err, ErrInvalidState) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// CancelRun ends a run when its panel closes. A run in flight is cancelled;
+// an approved call executing outside the lock (external mode) is waited for;
+// an interrupted one has its pending approvals rejected ("cancelled") and those
+// results added to the conversation state without asking the model, so the
+// conversation can take a new run. A run already over is left as it is.
+func (s *Service) CancelRun(ctx context.Context, runID int64) error {
+	ctx, end, err := s.begin(ctx, 0)
+	if err != nil {
+		return err
+	}
+	defer end()
+	release, err := s.ledger.hold(ctx, func() ([]int64, error) { return []int64{runID}, nil })
+	if err != nil {
+		return err
+	}
+	defer release()
+	state, err := s.ledger.state(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if state == "" {
+		return fmt.Errorf("run %d not found", runID)
+	}
+	if state != "interrupted" {
+		return nil
+	}
+	convID, err := s.ledger.close(ctx, runID, "cancelled", msgCancelled)
+	s.bus.Publish(events.Event{Type: events.ApprovalsChanged, ConversationID: convID})
+	return err
+}
+
+// closedHistory closes runID's calls in conversation convID with results,
+// for the ledger's close: a question asked again that ends this way replaces
+// nothing, and a host proposal left no call in the conversation.
+func (s *Service) closedHistory(ctx context.Context, convID, runID int64, snap snapshot, results []ai.ToolResult) ([]sqlite.Statement, func(), error) {
+	var stmts []sqlite.Statement
+	if snap.ReadMail {
+		stmts = append(stmts, markConvReadMail(convID))
+	}
+	rw, err := s.runRewind(ctx, runID)
+	switch {
+	case err != nil:
+		return nil, nil, err
+	case rw != nil:
+		return append(stmts, discardRewind(convID, runID, *rw)...), func() { s.putGrantsBack(runID) }, nil
+	case snap.Host:
+		return stmts, nil, nil
+	}
+	h, err := s.history(ctx, convID)
+	if err != nil {
+		return nil, nil, err
+	}
+	closed, ch, err := h.Close(results)
+	if err != nil {
+		return nil, nil, err
+	}
+	stmts = append(stmts, historyStmts(convID, ch)...)
+	return append(stmts, sqlite.Statement{SQL: "UPDATE runs SET hist_to = ? WHERE id = ? AND hist_from IS NOT NULL", Args: []any{closed.Next(), runID}}), nil, nil
+}

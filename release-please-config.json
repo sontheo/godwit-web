@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "go",
+      "package-name": "godwit",
+      "include-component-in-tag": false,
+      "bump-minor-pre-major": true,
+      "exclude-paths": ["site"],
+      "draft": true,
+      "force-tag-creation": true,
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "mygo.config.ts"
+        },
+        {
+          "type": "json",
+          "path": "sdk/package.json",
+          "jsonpath": "$.version"
+        }
+      ],
+      "include-commit-authors": true
+    }
+  }
+}

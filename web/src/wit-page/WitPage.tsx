@@ -1,0 +1,317 @@
+import { cn } from "cn";
+import { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
+import { Toaster } from "@/components/ui/sonner";
+import {
+  type Approval,
+  WitPage as api,
+  events,
+  type MailHit,
+  type WitHistory,
+  type WitOpenMsg,
+  type WitPageState,
+} from "@/mygo";
+import { type T, timeZone, useT } from "@/shared/i18n";
+import { forwardShortcuts } from "@/shared/shortcuts";
+import { applyTheme, type Theme } from "@/shared/theme";
+import { type Decide, formRound, Panel, witError } from "@/wit/Panel";
+import { useResume } from "@/wit/resume";
+import { WitTransport } from "@/wit/transport";
+
+/** The main window shows its material (macOS): the page tints it as the native root does. */
+const material = new URLSearchParams(location.search).has("material");
+const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/**
+ * The Wit page, embedded in the main window's Wit section: the route's ask conversation (0: a new
+ * one) and its input. Native owns the sidebar, the title and the no-model state.
+ *
+ * Listeners first (witOpen, witState, the transport's wit), then load: mygo drops events sent
+ * before a listener exists, so Go keeps the route's conversation as a versioned snapshot that load
+ * returns and witOpen carries, and only a newer version applies. A switch ends the old stream and
+ * follows the new conversation under a new generation (an older follow's or ask's result is
+ * ignored); the core run goes on. A first question's conversation is kept for the next one; the
+ * witOpen native sends for it (maybe before ask returns) is the conversation shown, no switch.
+ */
+/** The skills the input's / menu lists (one reference: the panel reads them once). */
+const skills = () => api.skills();
+
+export function WitPage() {
+  const [st, setSt] = useState<WitPageState>();
+  const [view, setView] = useState<{ history: WitHistory; tr: WitTransport; key: number }>();
+  const [handed, setHanded] = useState<{ text: string; hits: MailHit[] }>(); // a question native handed over, with the mail it quotes
+  const [mode, setMode] = useState<Theme["mode"]>();
+  const witResume = useResume(view?.tr);
+  const resetResume = useRef(witResume.reset);
+  // the shown conversation's model and reasoning effort, as the next question asks on them
+  const pick = useRef({ model: "", effort: "" });
+  resetResume.current = witResume.reset;
+
+  useEffect(() => {
+    let live = true;
+    const conv = { current: -1 }; // shown: none yet
+    let version = 0; // the snapshot's applied
+    let gen = 0; // the selection
+    let creating: Promise<unknown> | undefined; // a first question's ask in flight
+    const tr = new WitTransport({
+      ask: (text, quoted = [], rewind = "") => {
+        const g = gen;
+        const p = api
+          .ask(
+            conv.current,
+            text,
+            quoted,
+            pick.current.model,
+            pick.current.effort,
+            rewind,
+            timeZone(),
+          )
+          .then((rs) => {
+            if (g === gen) conv.current = rs.conversation;
+            return { run: rs.run, turn: rs.turn };
+          });
+        if (conv.current === 0) {
+          const c: Promise<unknown> = p
+            .catch(() => {})
+            .finally(() => {
+              if (creating === c) creating = undefined;
+            });
+          creating = c;
+        }
+        return p;
+      },
+      follow: () => api.follow(conv.current),
+      stop: (run) => api.stop(run),
+      compact: () => api.compact(conv.current),
+      rewinds: true,
+    });
+    const open = (c: number) => {
+      conv.current = c;
+      const g = ++gen;
+      setView(undefined);
+      pick.current = { model: "", effort: "" };
+      resetResume.current();
+      tr.follow().then(
+        (history) => {
+          if (!live || !history || g !== gen) return;
+          pick.current = { model: history.model, effort: history.effort };
+          setView({ history, tr, key: g });
+        },
+        (e) => {
+          if (live && g === gen) {
+            setHanded(undefined); // a question for this conversation is not carried to the next
+            toast.error(message(e));
+          }
+        },
+      );
+    };
+    // The creation's notice waits for the ask (which keeps the conversation); navigation switches
+    // at once, and the ask's result is then not shown (a Stop asked for still stops its run).
+    const onOpen = (m: Omit<WitOpenMsg, "created"> & { created?: boolean }) => {
+      if (m.version <= version) return;
+      version = m.version;
+      const apply = () => {
+        if (live && version === m.version && m.conversation !== conv.current) open(m.conversation);
+      };
+      if (creating && m.created) void creating.then(apply);
+      else apply();
+    };
+    // A question native handed over: taken once, as its event comes or, the event missed while
+    // the page loaded, once it has.
+    const take = () =>
+      api.takeAsk().then(
+        (h) => live && h.text && setHanded({ text: h.text, hits: h.hits ?? [] }),
+        (e) => live && toast.error(message(e)),
+      );
+    let pushed = false; // a witState came: newer than Load's state fields
+    const offs = [
+      events.witOpen.on(onOpen),
+      events.witAsk.on(take),
+      events.witState.on((s) => {
+        pushed = true;
+        setSt(s);
+        onOpen(s);
+      }),
+    ];
+    api.load().then(
+      (s) => {
+        if (!live) return;
+        if (!pushed) setSt(s);
+        onOpen(s);
+        void take();
+      },
+      (e) => live && toast.error(message(e)),
+    );
+    return () => {
+      live = false;
+      for (const off of offs) off();
+      tr.close();
+    };
+  }, []);
+
+  useEffect(
+    () =>
+      forwardShortcuts(
+        (dir) => api.navigate(dir),
+        window,
+        () => api.search(),
+      ),
+    [],
+  );
+
+  const theme = st?.theme as Theme | undefined;
+  useEffect(() => {
+    if (!theme) return;
+    const apply = (t: Theme) => {
+      setMode(t.mode);
+      return applyTheme(t);
+    };
+    let stop = apply(theme);
+    const off = events.theme.on((t) => {
+      stop();
+      stop = apply(t as Theme);
+    });
+    return () => {
+      off();
+      stop();
+    };
+  }, [theme]);
+
+  const t = useT(st?.locale);
+  if (!st) return <main />;
+  return (
+    <main className={cn("h-screen", material && "bg-window-material")}>
+      {view && (
+        <Conversation
+          key={view.key}
+          view={view}
+          model={st.model}
+          pick={pick}
+          resume={witResume.resume}
+          decide={witResume.decide}
+          handed={handed}
+          onAsked={() => setHanded(undefined)}
+          t={t}
+        />
+      )}
+      <Toaster theme={mode ?? (st.theme as Theme).mode} />
+    </main>
+  );
+}
+
+function Conversation({
+  view,
+  model,
+  pick,
+  resume,
+  decide,
+  handed,
+  onAsked,
+  t,
+}: {
+  view: { history: WitHistory; tr: WitTransport };
+  model: string;
+  pick: { current: { model: string; effort: string } };
+  resume?: { run: number };
+  decide: ReturnType<typeof useResume>["decide"];
+  handed?: { text: string; hits: MailHit[] };
+  onAsked(): void;
+  t: T;
+}) {
+  const fail = (e: unknown) => toast.error(witError(message(e), t));
+  const [ref, setRef] = useState(view.history.model);
+  const [effort, setEffort] = useState(view.history.effort);
+  const onDecide: Decide = async (a, accept, all, editedArgs) => {
+    try {
+      await decide(a.run, () =>
+        all
+          ? api.decideAll(a.run, accept)
+          : editedArgs !== undefined
+            ? api.decideWithArgs(a.id, accept, editedArgs)
+            : api.decide(a.id, accept),
+      );
+      return true;
+    } catch (e) {
+      fail(e);
+      return false;
+    }
+  };
+  const onSession = async (a: Approval) => {
+    try {
+      await decide(a.run, () => api.decideSession(a.id));
+      return true;
+    } catch (e) {
+      fail(e);
+      return false;
+    }
+  };
+  const onAnswer = async (a: Approval, answers: string[][]) => {
+    try {
+      await decide(a.run, () => api.answer(a.id, formRound(a), answers));
+      return true;
+    } catch (e) {
+      fail(e);
+      return false;
+    }
+  };
+  return (
+    <Panel
+      layout="page"
+      history={view.history}
+      transport={view.tr}
+      locked={false}
+      resume={resume}
+      onDecide={onDecide}
+      onAnswer={onAnswer}
+      onSession={onSession}
+      onSearch={(q) => api.searchMail(q)}
+      skills={skills}
+      onNew={() => void api.newConversation().catch(fail)}
+      onLink={(url) => api.openLink(url)}
+      onCite={(id) =>
+        api.openCited(id).catch((e) => {
+          fail(e);
+          throw e;
+        })
+      }
+      onCheckCited={(id) =>
+        api.checkCited(id).catch((e) => {
+          fail(e);
+          throw e;
+        })
+      }
+      onDraft={(id) =>
+        api.openDraft(id).catch((e) => {
+          fail(e);
+          throw e;
+        })
+      }
+      onEditRule={(a) =>
+        decide(a.run, () => api.editRule(a.id)).catch((e) => {
+          fail(e);
+          throw e;
+        })
+      }
+      ask={handed}
+      onAsked={onAsked}
+      t={t}
+      model={model}
+      onModels={() => void api.openModels().catch(fail)}
+      models={{
+        ref,
+        list: () => api.models(),
+        pick: (r) => {
+          pick.current.model = r;
+          setRef(r);
+        },
+      }}
+      effort={{
+        value: effort,
+        pick: (e) => {
+          pick.current.effort = e;
+          setEffort(e);
+        },
+      }}
+    />
+  );
+}

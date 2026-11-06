@@ -1,0 +1,346 @@
+---
+import "../styles.css";
+import { umami } from "../analytics";
+import logo from "../assets/logo.svg?raw";
+import { demos } from "../demo";
+import { strings } from "../i18n";
+import { type Lang, locales, names, paths } from "../locales";
+import AppDemo from "./AppDemo.astro";
+import Icon from "./Icon.astro";
+import Privacy from "./Privacy.astro";
+
+interface Props {
+	lang: Lang;
+}
+
+const { lang } = Astro.props;
+const s = strings[lang];
+// Each language at its fixed path; / is any of them, by the browser's languages (src/worker.ts).
+const self = paths[lang];
+const featureIcons = ["mail", "sparkles", "file-text", "cpu", "puzzle", "robot"] as const;
+// The Store's own installer for the app: it downloads a small .exe that installs Godwit from the Store.
+const storeUrl = "https://get.microsoft.com/installer/download/9NS3Q2CGWD12?referrer=appbadge";
+const platforms = [
+	{ name: "macOS", icon: "apple", note: s.macNote, main: { label: s.downloadMac, href: "/download/darwin-arm64", icon: "apple" }, others: [{ label: s.intel, href: "/download/darwin-amd64" }] },
+	{
+		name: "Windows",
+		icon: "windows",
+		note: s.windowsNote,
+		main: { label: s.microsoftStore, href: storeUrl, icon: "microsoft" },
+		others: [{ label: s.installer, href: "/download/windows-amd64" }, { label: s.windowsArm, href: "/download/windows-arm64" }],
+	},
+	{ name: "Linux", icon: "ubuntu", note: s.linuxNote, main: { label: s.downloadLinux, href: "/download/linux-amd64", icon: "ubuntu" }, others: [{ label: s.arm64, href: "/download/linux-arm64" }] },
+] as const;
+const commands = [
+	{ label: s.homebrew, method: "homebrew", cmd: "brew install godwit-email/tap/godwit" },
+	{ label: s.installScript, method: "script", cmd: "curl -fsSL https://dl.godwit.email/install.sh | sh" },
+];
+// A download link's target in the events: its /download/<target>, or the Store.
+const targetOf = (href: string) => (href === storeUrl ? "ms-store" : href.slice("/download/".length));
+const github = "https://github.com/godwit-email/godwit";
+const mark = logo.replace("<svg ", '<svg aria-hidden="true" class="size-full" ');
+---
+
+<!doctype html>
+<html lang={lang}>
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>{s.title}</title>
+		<meta name="description" content={s.description} />
+		<link rel="icon" href="/icon.png" type="image/png" />
+		<link rel="apple-touch-icon" href="/icon.png" />
+		<link rel="canonical" href={new URL(self, Astro.site)} />
+		{locales.map((l) => <link rel="alternate" hreflang={l} href={new URL(paths[l], Astro.site)} />)}
+		<link rel="alternate" hreflang="x-default" href={new URL("/", Astro.site)} />
+		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content="Godwit" />
+		<meta property="og:url" content={new URL(self, Astro.site)} />
+		<meta property="og:title" content={s.title} />
+		<meta property="og:description" content={s.description} />
+		<meta property="og:image" content={new URL(`/og${self.slice(0, -1)}.png`, Astro.site)} />
+		<meta property="og:image:width" content="1200" />
+		<meta property="og:image:height" content="630" />
+		<meta property="og:image:alt" content={s.headline.join(lang === "en" ? " " : "")} />
+		<meta name="twitter:card" content="summary_large_image" />
+		<meta name="theme-color" content="#ededed" media="(prefers-color-scheme: light)" />
+		<meta name="theme-color" content="#1e1e1e" media="(prefers-color-scheme: dark)" />
+		<!-- Before first paint: motion.ts may hide what it brings in. -->
+		<script is:inline>
+			if (!matchMedia("(prefers-reduced-motion: reduce)").matches) document.documentElement.classList.add("motion");
+		</script>
+		<!-- Website-only analytics (src/analytics.ts); the domain filter keeps local previews out of the stats. -->
+		<script is:inline defer src={`${umami.origin}/script.js`} data-website-id={umami.website} data-domains={umami.domain}></script>
+	</head>
+	<body class="bg-background">
+		<header class="mx-auto flex h-16 max-w-6xl items-center px-6">
+			<!-- Hovering or focusing the mark: the bird takes off, and a card says where the name comes from. -->
+			<div class="group relative">
+				<a href={self} aria-describedby="name-origin" class="flex items-center gap-2.5 font-semibold tracking-tight">
+					<span class="size-6 transition-transform duration-500 ease-out group-focus-within:translate-x-1 group-focus-within:-translate-y-1 group-focus-within:-rotate-6 group-hover:translate-x-1 group-hover:-translate-y-1 group-hover:-rotate-6" set:html={mark} />
+					Godwit
+				</a>
+				<div
+					id="name-origin"
+					role="tooltip"
+					class="pointer-events-none invisible absolute top-full left-0 z-10 w-64 translate-y-1 pt-2 opacity-0 transition duration-200 ease-out group-focus-within:visible group-focus-within:translate-y-0 group-focus-within:opacity-100 group-hover:visible group-hover:translate-y-0 group-hover:opacity-100 group-hover:delay-150"
+				>
+					<div class="rounded-xl bg-background p-3.5 text-sm leading-relaxed text-muted-foreground shadow-float">
+						<div class="mb-1 font-medium text-foreground italic">Limosa lapponica</div>
+						{s.name}
+					</div>
+				</div>
+			</div>
+			<nav class="ml-auto flex items-center gap-1 text-sm">
+				<a href="#download" data-umami-event="download-section-jump" data-umami-event-location="header" class="rounded-md px-3 py-1.5 text-muted-foreground transition-colors hover:text-foreground">{s.download}</a>
+				{
+					locales
+						.filter((l) => l !== lang)
+						.map((l) => (
+							<a href={paths[l]} hreflang={l} lang={l} data-umami-event="language-switch" data-umami-event-to={l} class="rounded-md px-3 py-1.5 text-muted-foreground transition-colors hover:text-foreground">
+								{names[l]}
+							</a>
+						))
+				}
+				<a href={github} data-umami-event="outbound-click" data-umami-event-dest="github" data-umami-event-location="header" class="rounded-md p-1.5 text-muted-foreground transition-colors hover:text-foreground" aria-label={s.github}>
+					<Icon name="github" class="size-5" />
+				</a>
+			</nav>
+		</header>
+
+		<main>
+			<section data-hero class="mx-auto max-w-4xl px-6 pt-16 pb-14 text-center sm:pt-24">
+				<!-- The newest release: src/worker.ts fills these in and unhides them once there is one. -->
+				<a
+					data-release
+					data-release-link
+					hidden
+					href={`${github}/releases/latest`}
+					data-umami-event="outbound-click"
+					data-umami-event-dest="release-notes"
+					data-umami-event-location="hero"
+					class="mb-7 inline-flex items-center gap-2 rounded-full border py-1 pr-2.5 pl-3 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+				>
+					<span class="size-1.5 rounded-full bg-green-500"></span>
+					<span><span data-version class="font-medium text-foreground"></span> {s.release.out}</span>
+					<span class="text-border">|</span>
+					<span class="inline-flex items-center gap-1">{s.release.whatsNew}<Icon name="arrow-right" class="size-3.5" /></span>
+				</a>
+				<!-- Where the bird (src/bird.ts) settles after flying in. -->
+				<div data-bird-perch aria-hidden="true" class="h-6 sm:h-10"></div>
+				<h1 data-headline class="text-4xl font-semibold tracking-tight sm:text-6xl">{s.headline.map((p) => <span class="inline-block">{p}</span>)}</h1>
+				<p class="mx-auto mt-6 max-w-2xl text-lg leading-relaxed text-pretty text-muted-foreground">{s.sub}</p>
+				<div class="mt-9 flex flex-wrap items-center justify-center gap-3">
+					<a
+						data-press
+						data-primary
+						href="/download/darwin-arm64"
+						data-umami-event="download-click"
+						data-umami-event-target="darwin-arm64"
+						data-umami-event-location="hero"
+						data-labels={JSON.stringify({ darwin: s.downloadMac, windows: s.downloadWindows, linux: s.downloadLinux })}
+						class="inline-flex h-11 items-center gap-2 rounded-lg bg-primary px-5 font-medium text-primary-foreground transition-opacity hover:opacity-90"
+					>
+						<span data-os-icon="darwin" class="inline-flex"><Icon name="apple" /></span>
+						<span data-os-icon="linux" hidden class="inline-flex"><Icon name="ubuntu" /></span>
+						<span>{s.downloadMac}</span>
+					</a>
+					<!-- On Windows the Store is the way in: the script swaps it for the primary button. -->
+					<a
+						data-press
+						data-store
+						href={storeUrl}
+						data-umami-event="download-click"
+						data-umami-event-target="ms-store"
+						data-umami-event-location="hero"
+						class="hidden h-11 items-center gap-2 rounded-lg bg-primary px-5 font-medium text-primary-foreground transition-opacity hover:opacity-90">
+						<Icon name="microsoft" />
+						<span>{s.microsoftStore}</span>
+					</a>
+					<a href="#download" data-press data-umami-event="download-section-jump" data-umami-event-location="hero" class="inline-flex h-11 items-center rounded-lg border px-5 font-medium transition-colors hover:bg-accent">{s.otherPlatforms}</a>
+				</div>
+			</section>
+
+			<section class="px-3 sm:px-6">
+				<AppDemo demo={demos[lang]} />
+				<p data-reveal class="mt-4 text-center text-sm text-muted-foreground">{demos[lang].hint}</p>
+			</section>
+
+			<section class="mx-auto max-w-6xl px-6 pt-28">
+				<h2 data-reveal class="mx-auto max-w-2xl text-center text-3xl font-semibold tracking-tight text-balance sm:text-4xl">{s.featuresTitle}</h2>
+				<div data-reveal-group class="mt-14 grid gap-x-10 gap-y-12 sm:grid-cols-2 lg:grid-cols-3">
+					{
+						s.features.map((f, i) => (
+							<div>
+								<span class="grid size-9 place-items-center rounded-lg border bg-sidebar">
+									<Icon name={featureIcons[i]} class="size-[18px]" />
+								</span>
+								<h3 class="mt-4 font-semibold">{f.title}</h3>
+								<p class="mt-2 leading-relaxed text-muted-foreground">{f.body}</p>
+							</div>
+						))
+					}
+				</div>
+			</section>
+
+			<Privacy p={s.privacy} />
+
+			<section id="download" class="mx-auto max-w-6xl scroll-mt-8 px-6 pt-28 pb-24">
+				<div data-reveal>
+					<h2 class="text-center text-3xl font-semibold tracking-tight sm:text-4xl">{s.downloadTitle}</h2>
+					<p class="mt-4 text-center text-muted-foreground">{s.downloadSub}</p>
+					<p data-release hidden class="mt-2 text-center text-sm text-muted-foreground">
+						{s.release.latest} <span data-version class="font-medium text-foreground"></span><span data-release-date-wrap>{s.release.on}<span data-release-date></span></span>{" · "}
+						<a
+							data-release-link
+							href={`${github}/releases/latest`}
+							data-umami-event="outbound-click"
+							data-umami-event-dest="release-notes"
+							data-umami-event-location="download"
+							class="underline underline-offset-4 hover:text-foreground">{s.release.notes}</a>
+					</p>
+				</div>
+				<div data-reveal-group class="mt-12 grid gap-4 lg:grid-cols-3">
+					{
+						platforms.map((p) => (
+							<div class="flex flex-col rounded-xl border p-6">
+								<div class="flex items-center gap-2 font-semibold">
+									<Icon name={p.icon} class="size-[18px]" />
+									{p.name}
+								</div>
+								<p class="mt-2 flex-1 text-sm text-muted-foreground">{p.note}</p>
+								<a
+									data-press
+									href={p.main.href}
+									data-umami-event="download-click"
+									data-umami-event-target={targetOf(p.main.href)}
+									data-umami-event-location="card"
+									class="mt-5 inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-primary px-5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90">
+									<Icon name={p.main.icon} class="size-[18px]" />
+									{p.main.label}
+								</a>
+								<!-- Hover, or a click or tap, opens the other builds; the script keeps data-open to one menu and closes it on an outside click or Escape. -->
+								<div data-more data-platform={p.name.toLowerCase()} class="group relative mt-3 text-center">
+									<button type="button" aria-expanded="false" class="inline-flex items-center gap-0.5 text-sm text-muted-foreground transition-colors hover:text-foreground">
+										{s.otherVersions}
+										<Icon name="chevron-down" class="size-4" />
+									</button>
+									<div class="invisible absolute inset-x-0 top-full z-10 -translate-y-1 pt-1 opacity-0 transition duration-200 ease-out group-hover:visible group-hover:translate-y-0 group-hover:opacity-100 group-data-[open]:visible group-data-[open]:translate-y-0 group-data-[open]:opacity-100">
+										<div class="flex flex-col rounded-xl bg-background p-1 text-sm shadow-float">
+											{p.others.map((o) => (
+												<a
+													href={o.href}
+													data-umami-event="download-click"
+													data-umami-event-target={targetOf(o.href)}
+													data-umami-event-location="other-versions"
+													class="inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 transition-colors hover:bg-accent">
+													<Icon name="download" class="size-3.5" />
+													{o.label}
+												</a>
+											))}
+										</div>
+									</div>
+								</div>
+							</div>
+						))
+					}
+				</div>
+				<div data-reveal-group class="mt-4 grid gap-4 md:grid-cols-2">
+					{
+						commands.map((c) => (
+							<div class="rounded-xl border p-5">
+								<div class="text-sm text-muted-foreground">{c.label}</div>
+								<div class="mt-2 flex items-center gap-2 rounded-lg bg-sidebar py-1.5 pr-1.5 pl-3">
+									<code class="min-w-0 flex-1 truncate font-mono text-[13px]">{c.cmd}</code>
+									<button
+										data-press
+										type="button"
+										data-copy={c.cmd}
+										data-method={c.method}
+										data-done={s.copied}
+										class="inline-flex h-7 shrink-0 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+									>
+										<Icon name="copy" class="size-3.5" />
+										<span>{s.copy}</span>
+									</button>
+								</div>
+							</div>
+						))
+					}
+				</div>
+			</section>
+		</main>
+		<!-- The logo's bird in flight, drawn live over the whole window by src/bird.ts. -->
+		<canvas data-bird aria-hidden="true" class="pointer-events-none fixed inset-0 z-30 size-full"></canvas>
+
+		<footer class="border-t">
+			<div class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-6 py-8 text-sm text-muted-foreground">
+				<span class="flex items-center gap-2">
+					<span class="size-4" set:html={mark} />© 2026 The Godwit Authors
+				</span>
+				<a href={`${github}/blob/main/LICENSE`} data-umami-event="outbound-click" data-umami-event-dest="license" data-umami-event-location="footer" class="hover:text-foreground">{s.license}</a>
+				<a href={`${self}privacy/`} class="hover:text-foreground">{s.privacyPolicy}</a>
+				<a href={github} data-umami-event="outbound-click" data-umami-event-dest="github" data-umami-event-location="footer" class="ml-auto inline-flex items-center gap-1.5 hover:text-foreground">
+					<Icon name="github" />
+					{s.github}
+				</a>
+			</div>
+		</footer>
+
+		<script>
+			import { track } from "../analytics";
+			import { platformForUserAgent } from "../platform";
+
+			const { os, arch } = platformForUserAgent(navigator.userAgent);
+			const primary = document.querySelector<HTMLAnchorElement>("[data-primary]")!;
+			const labels = JSON.parse(primary.dataset.labels!) as Record<string, string>;
+			primary.href = `/download/${os}-${arch}`;
+			primary.dataset.umamiEventTarget = `${os}-${arch}`;
+			primary.querySelector("span:last-child")!.textContent = labels[os];
+			for (const icon of primary.querySelectorAll<HTMLElement>("[data-os-icon]")) icon.hidden = icon.dataset.osIcon !== os;
+			if (os === "windows") {
+				primary.hidden = true;
+				document.querySelector<HTMLElement>("[data-store]")!.classList.replace("hidden", "inline-flex");
+			}
+			const menus = [...document.querySelectorAll<HTMLElement>("[data-more]")];
+			const setOpen = (more: HTMLElement, open: boolean) => {
+				more.toggleAttribute("data-open", open);
+				more.querySelector("button")!.setAttribute("aria-expanded", String(open));
+			};
+			for (const more of menus) {
+				more.querySelector("button")!.addEventListener("click", () => {
+					const open = !more.hasAttribute("data-open");
+					for (const m of menus) setOpen(m, m === more && open);
+					if (open) track("download-menu-open", { platform: more.dataset.platform! });
+				});
+			}
+			document.addEventListener("click", (e) => {
+				for (const m of menus) if (!m.contains(e.target as Node)) setOpen(m, false);
+			});
+			document.addEventListener("keydown", (e) => {
+				if (e.key === "Escape") for (const m of menus) setOpen(m, false);
+			});
+			for (const demo of document.querySelectorAll<HTMLElement>("[data-demo]")) demo.dataset.platform = os;
+
+			for (const b of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
+				b.addEventListener("click", () => {
+					navigator.clipboard?.writeText(b.dataset.copy!).catch(() => {});
+					track("install-command-copy", { method: b.dataset.method! });
+					const label = b.querySelector("span")!;
+					const was = label.textContent;
+					label.textContent = b.dataset.done!;
+					setTimeout(() => (label.textContent = was), 1500);
+				});
+			}
+		</script>
+		<script>
+			import "../motion";
+
+			// three.js and the model load after the page, in their own chunk.
+			const bird = document.querySelector<HTMLCanvasElement>("[data-bird]");
+			const perch = document.querySelector<HTMLElement>("[data-bird-perch]");
+			const headline = document.querySelector<HTMLElement>("[data-headline]");
+			if (bird && perch && headline) import("../bird").then((m) => m.mount(bird, perch, headline, document.querySelector<HTMLElement>("[data-demo]")));
+		</script>
+	</body>
+</html>

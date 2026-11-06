@@ -1,0 +1,1855 @@
+package app
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/egoist/mygo/ui"
+	"github.com/godwit-email/godwit/core"
+	"github.com/godwit-email/godwit/core/coretest"
+	gomail "github.com/godwit-email/godwit/core/mail"
+	"github.com/godwit-email/godwit/internal/i18n"
+	"github.com/godwit-email/godwit/internal/theme"
+)
+
+var readerAvatarSVG = []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" fill="#ff0000"/></svg>`)
+
+// avatarHarness maps image requests to a local TLS fixture; the real core,
+// image cache, image validation and reader conversion remain in the path.
+func avatarHarness(t *testing.T, mode string, handler http.HandlerFunc) (*harness, core.Account) {
+	t.Helper()
+	srv := httptest.NewTLSServer(handler)
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := srv.Client().Transport.(*http.Transport).Clone()
+	tr.TLSClientConfig.ServerName = u.Hostname()
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, u.Host)
+	}
+	t.Cleanup(tr.CloseIdleConnections)
+	var acc core.Account
+	h := newHarnessWith(t, []coretest.Option{coretest.WithoutAutoSync()}, func(e *coretest.Env) {
+		if err := e.Svc.Close(); err != nil {
+			t.Fatal(err)
+		}
+		e.Svc, err = core.New(t.Context(), core.Options{DataDir: e.DataDir, ImageClient: &http.Client{Transport: tr}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { e.Svc.Close() })
+		st, err := e.Svc.GetSettings(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.RemoteImages = mode
+		if _, err := e.Svc.SetSettings(t.Context(), st); err != nil {
+			t.Fatal(err)
+		}
+		acc = e.AddAccount(t, "alice@example.com")
+	})
+	h.plat.svc = h.env.Svc
+	h.until("mail page", func() bool { return h.app.loaded && h.app.route.Page == PageMail })
+	return h, acc
+}
+
+func TestReaderAvatarLoadsWithoutLayoutJump(t *testing.T) {
+	started, release := make(chan struct{}, 1), make(chan struct{})
+	h, acc := avatarHarness(t, "ask", func(w http.ResponseWriter, req *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		w.Write(readerAvatarSVG)
+	})
+	t.Cleanup(func() { close(release) })
+	m := h.deliverOne(acc, coretest.Msg("Bob <bob@example.com>", acc.Email, "Avatar", "plain"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.see("B")
+	before, ok := h.tt.Find("Bob")
+	if !ok || before.W != 32 || before.H != 32 {
+		t.Fatalf("initial avatar %+v", before)
+	}
+	h.see("1 张图片未加载")
+	h.click("加载")
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("avatar request did not start")
+	}
+	if !h.app.mail.reader.bodies[m.ID].ready {
+		t.Fatal("avatar blocked body loading")
+	}
+	release <- struct{}{}
+	h.until("avatar", func() bool { return h.app.mail.reader.bodies[m.ID].avatar != nil })
+	after, _ := h.tt.Find("Bob")
+	if before != after || slices.Contains(h.tt.Texts(), "B") {
+		t.Fatalf("layout %v -> %v, texts %q", before, after, h.tt.Texts())
+	}
+	if px := h.tt.Image().RGBAAt(int(after.X+16), int(after.Y+16)); px.R < 250 || px.G > 5 || px.B > 5 {
+		t.Fatalf("avatar color %v", px)
+	}
+}
+
+func TestReaderAvatarPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, folder string
+		blocked            bool
+	}{
+		{"disabled", "ask", "INBOX", true}, {"untrusted", "trusted", "INBOX", true}, {"junk", "auto", "Junk", true}, {"automatic", "auto", "INBOX", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int64
+			h, acc := avatarHarness(t, tc.mode, func(w http.ResponseWriter, req *http.Request) { hits.Add(1); w.Write(readerAvatarSVG) })
+			if tc.folder == "Junk" {
+				if err := h.env.IMAP(acc.ID).User.Create("Junk", nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.env.Deliver(t, acc.ID, tc.folder, coretest.Msg("Bob <bob@example.com>", acc.Email, "Avatar", "plain"))
+			folders, err := h.env.Svc.ListFolders(t.Context(), acc.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var folder int64
+			for _, f := range folders {
+				if f.Name == tc.folder {
+					folder = f.ID
+				}
+			}
+			page, err := h.env.Svc.ListMessages(t.Context(), core.View{FolderID: folder}, "", 20)
+			if err != nil || len(page.Items) == 0 {
+				t.Fatalf("messages %v %v", page, err)
+			}
+			m := page.Items[0]
+			h.openThread(m.ThreadID)
+			h.seeBody(m.ID)
+			b := h.app.mail.reader.bodies[m.ID]
+			if tc.blocked {
+				h.see("1 张图片未加载")
+				if hits.Load() != 0 || b.msg.RemoteImagesBlocked != 0 {
+					t.Fatalf("blocked: hits %d, body count %d", hits.Load(), b.msg.RemoteImagesBlocked)
+				}
+				h.click("加载")
+			}
+			h.until("avatar ready", func() bool { return b.avatar != nil })
+			if hits.Load() != 1 {
+				t.Fatalf("requests %d", hits.Load())
+			}
+			if tc.blocked && !b.allow {
+				t.Fatal("manual permission not kept for current message")
+			}
+		})
+	}
+}
+
+func TestReaderAvatarDropsStaleResults(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	m := h.deliverOne(accs[0], coretest.Msg("Bob <bob@example.com>", accs[0].Email, "Old", "old"))
+	n := h.deliverOne(accs[0], coretest.Msg("Carol <carol@example.com>", accs[0].Email, "New", "new"))
+	r := h.app.mail.reader
+	started, release, finished := make(chan struct{}), make(chan struct{}, 1), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	r.getAvatar = func(ctx context.Context, id int64, manual bool) (core.Avatar, error) {
+		if id == m.ID {
+			close(started)
+			<-release
+			close(finished)
+			return core.Avatar{Data: readerAvatarSVG, Format: "svg"}, nil
+		}
+		return core.Avatar{}, nil
+	}
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("avatar did not start")
+	}
+	old := r.bodies[m.ID]
+	h.openThread(n.ThreadID)
+	h.seeBody(n.ID)
+	release <- struct{}{}
+	<-finished
+	h.queued("old avatar callback", 1)
+	h.drain()
+	if old.avatar != nil || r.bodies[n.ID].avatar != nil {
+		t.Fatal("stale avatar applied")
+	}
+}
+
+func TestReaderAvatarPulsesUntilDone(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	r := h.app.mail.reader
+	release := make(chan struct{})
+	r.getAvatar = func(context.Context, int64, bool) (core.Avatar, error) {
+		<-release
+		return core.Avatar{}, nil
+	}
+	m := h.deliverOne(accs[0], coretest.Msg("Bob <bob@example.com>", accs[0].Email, "Hi", "body"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.until("avatar started", func() bool { return r.bodies[m.ID].avatarStop != nil })
+	initial := func() bool { h.tt.Frame(); return slices.Contains(h.tt.Texts(), "B") }
+	if initial() {
+		t.Fatal("the initial shows while the avatar loads")
+	}
+	close(release)
+	h.until("the initial after", initial)
+}
+
+func TestReaderAvatarParseFailure(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	r := h.app.mail.reader
+	r.getAvatar = func(context.Context, int64, bool) (core.Avatar, error) {
+		return core.Avatar{Data: []byte("invalid SVG"), Format: "svg"}, nil
+	}
+	m := h.deliverOne(accs[0], coretest.Msg("Bob <bob@example.com>", accs[0].Email, "Bad", "body"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.until("avatar completed", func() bool { b := r.bodies[m.ID]; return b.avatarStop == nil })
+	h.see("B")
+	if r.bodies[m.ID].avatar != nil {
+		t.Fatal("invalid SVG displayed")
+	}
+}
+
+func TestReaderAvatarSettingsInvalidation(t *testing.T) {
+	h, acc := avatarHarness(t, "auto", func(w http.ResponseWriter, req *http.Request) { w.Write(readerAvatarSVG) })
+	m := h.deliverOne(acc, coretest.Msg("Bob <bob@example.com>", acc.Email, "Avatar", "plain"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	b := h.app.mail.reader.bodies[m.ID]
+	h.until("initial avatar", func() bool { return b.avatar != nil })
+	st := h.app.settings
+	st.RemoteImages = "ask"
+	h.app.changeSettings(st)
+	if b.avatar != nil {
+		t.Fatal("optimistic setting left avatar displayed")
+	}
+	h.until("setting saved", func() bool { st, _ := h.env.Svc.GetSettings(t.Context()); return st.RemoteImages == "ask" })
+	h.advance(refreshEvery)
+	h.see("1 张图片未加载")
+	if b.avatar != nil || b.allow {
+		t.Fatal("automatic trust became manual permission")
+	}
+	h.click("加载")
+	h.until("explicitly allowed cached avatar", func() bool { return b.avatar != nil })
+	st.RemoteImages = "trusted"
+	h.app.changeSettings(st)
+	if b.avatar != nil {
+		t.Fatal("manual avatar survived changed policy")
+	}
+	h.until("trusted setting saved", func() bool { st, _ := h.env.Svc.GetSettings(t.Context()); return st.RemoteImages == "trusted" })
+	// A failed write rolls back to the actual trusted policy, still blocking.
+	h.app.saveSettings = func(context.Context, core.Settings) (core.Settings, error) {
+		return core.Settings{}, errors.New("disk full")
+	}
+	st.RemoteImages = "auto"
+	h.app.changeSettings(st)
+	h.see("disk full")
+	if b.avatar != nil {
+		t.Fatal("failed settings save exposed avatar")
+	}
+}
+
+func TestReaderAvatarWaitsForSettingsSave(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		fail, manual bool
+	}{{"saved ask", false, false}, {"rollback auto", true, false}, {"explicit permission while saving", false, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int64
+			h, acc := avatarHarness(t, "ask", func(w http.ResponseWriter, req *http.Request) {
+				hits.Add(1)
+				w.Write(readerAvatarSVG)
+			})
+			// First-sync imports do not race arrival prefetch against the policy changes below.
+			h.put(acc, "INBOX", coretest.Msg("Bob <bob@example.com>", acc.Email, "First", "plain"))
+			h.put(acc, "INBOX", coretest.Msg("Carol <carol@example.net>", acc.Email, "Second", "plain"))
+			h.syncNow(acc)
+			page, err := h.env.Svc.ListMessages(t.Context(), core.View{Unified: "inbox"}, "", 200)
+			if err != nil || len(page.Items) != 2 {
+				t.Fatalf("initial messages: %d, %v", len(page.Items), err)
+			}
+			m := page.Items[slices.IndexFunc(page.Items, func(m core.MessageSummary) bool { return m.Subject == "First" })]
+			n := page.Items[slices.IndexFunc(page.Items, func(m core.MessageSummary) bool { return m.Subject == "Second" })]
+			st := h.app.settings
+			st.RemoteImages = "auto"
+			h.app.changeSettings(st)
+			h.until("auto saved", func() bool { return h.app.settingsVer == h.app.settingsSavedVer })
+			h.openThread(m.ThreadID)
+			h.seeBody(m.ID)
+			r := h.app.mail.reader
+			h.until("initial avatar", func() bool { return r.bodies[m.ID].avatar != nil })
+			if hits.Load() != 1 {
+				t.Fatalf("initial requests %d", hits.Load())
+			}
+			started, release := make(chan struct{}), make(chan struct{}, 1)
+			t.Cleanup(func() { close(release) })
+			save := h.app.saveSettings
+			h.app.saveSettings = func(ctx context.Context, st core.Settings) (core.Settings, error) {
+				close(started)
+				select {
+				case <-ctx.Done():
+					return core.Settings{}, ctx.Err()
+				case <-release:
+				}
+				if tc.fail {
+					return core.Settings{}, errors.New("blocked save failed")
+				}
+				return save(ctx, st)
+			}
+			st.RemoteImages = "ask"
+			h.app.changeSettings(st)
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("save did not start")
+			}
+			persisted, err := h.env.Svc.GetSettings(t.Context())
+			if err != nil || persisted.RemoteImages != "auto" {
+				t.Fatalf("persisted policy %q, %v", persisted.RemoteImages, err)
+			}
+			r.toggle(m.ID)
+			r.toggle(m.ID)
+			h.seeBody(m.ID)
+			b := r.bodies[m.ID]
+			h.until("reopened avatar attempt", func() bool { return b.avatarDone || b.avatarStop == nil })
+			if b.avatar != nil {
+				t.Error("cached avatar displayed while restrictive setting is unsaved")
+			}
+			h.openThread(n.ThreadID)
+			h.seeBody(n.ID)
+			b = r.bodies[n.ID]
+			h.until("new message avatar attempt", func() bool { return b.avatarDone || b.avatarStop == nil })
+			if b.avatar != nil || hits.Load() != 1 {
+				t.Errorf("unsaved ask allowed new avatar: image %v, requests %d", b.avatar != nil, hits.Load())
+			}
+			if tc.manual {
+				h.click("加载")
+				h.until("explicit avatar while saving", func() bool { return b.avatar != nil })
+				if hits.Load() != 2 {
+					t.Errorf("explicit requests %d", hits.Load())
+				}
+			}
+			release <- struct{}{}
+			h.until("settings settled", func() bool { return h.app.settingsVer == h.app.settingsSavedVer })
+			h.advance(refreshEvery)
+			if tc.fail {
+				h.until("rollback restores automatic avatar", func() bool { return b.avatar != nil })
+				if h.app.settings.RemoteImages != "auto" || hits.Load() != 2 {
+					t.Fatalf("rollback policy %q, requests %d", h.app.settings.RemoteImages, hits.Load())
+				}
+			} else if !tc.manual {
+				h.until("saved ask policy applied", func() bool { return b.avatarDone && b.avatarBlocked })
+				if b.avatar != nil || hits.Load() != 1 {
+					t.Fatal("saved ask automatically loaded avatar")
+				}
+				h.click("加载")
+				h.until("manual avatar after save", func() bool { return b.avatar != nil })
+				if hits.Load() != 2 {
+					t.Errorf("manual requests %d", hits.Load())
+				}
+			}
+		})
+	}
+}
+
+func TestReaderAvatarManualPermissionSurvivesUnrelatedSettings(t *testing.T) {
+	for _, external := range []bool{false, true} {
+		t.Run(strconv.FormatBool(external), func(t *testing.T) {
+			var hits atomic.Int64
+			h, acc := avatarHarness(t, "ask", func(w http.ResponseWriter, req *http.Request) {
+				hits.Add(1)
+				w.Write(readerAvatarSVG)
+			})
+			m := h.deliverOne(acc, coretest.Msg("Bob <bob@example.com>", acc.Email, "Avatar", "plain"))
+			h.openThread(m.ThreadID)
+			h.seeBody(m.ID)
+			h.click("加载")
+			b := h.app.mail.reader.bodies[m.ID]
+			h.until("manual avatar", func() bool { return b.avatar != nil })
+			before := h.app.events
+			st := h.app.settings
+			st.Theme = "dark"
+			if external {
+				if _, err := h.env.Svc.SetSettings(t.Context(), st); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				h.app.changeSettings(st)
+			}
+			h.until("settings event", func() bool {
+				return h.app.events > before && h.app.settingsVer == h.app.settingsSavedVer
+			})
+			h.app.load()
+			h.until("new settings loaded", func() bool { return h.app.settings.Theme == "dark" && h.app.accountsGen == h.app.loadGen })
+			if b.avatar == nil || !b.avatarAllow || !b.allow || hits.Load() != 1 {
+				t.Fatalf("unrelated setting revoked permission: avatar=%v manual=%v body=%v requests=%d", b.avatar != nil, b.avatarAllow, b.allow, hits.Load())
+			}
+			st.RemoteImages = "trusted"
+			if _, err := h.env.Svc.SetSettings(t.Context(), st); err != nil {
+				t.Fatal(err)
+			}
+			h.app.load()
+			h.until("changed policy loaded", func() bool { return h.app.settings.RemoteImages == "trusted" })
+			if b.avatar != nil || b.avatarAllow {
+				t.Fatal("relevant policy change retained manual permission")
+			}
+		})
+	}
+}
+
+func TestReaderAvatarLifecycleCancellation(t *testing.T) {
+	for _, action := range []string{"settings", "account", "close", "body replacement"} {
+		t.Run(action, func(t *testing.T) {
+			h, accs := mailHarness(t, nil, "alice@example.com")
+			m := h.deliverOne(accs[0], coretest.Msg("Bob <bob@example.com>", accs[0].Email, "Avatar", "plain"))
+			r := h.app.mail.reader
+			started, release, cancelled := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			t.Cleanup(func() { close(release) })
+			r.getAvatar = func(ctx context.Context, id int64, manual bool) (core.Avatar, error) {
+				close(started)
+				<-ctx.Done()
+				close(cancelled)
+				<-release
+				return core.Avatar{Data: readerAvatarSVG, Format: "svg"}, nil
+			}
+			h.openThread(m.ThreadID)
+			h.seeBody(m.ID)
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("avatar did not start")
+			}
+			old := r.bodies[m.ID]
+			switch action {
+			case "settings":
+				st := h.app.settings
+				st.RemoteImages = "ask"
+				h.app.changeSettings(st)
+			case "account":
+				if err := h.env.Svc.RemoveAccount(t.Context(), accs[0].ID); err != nil {
+					t.Fatal(err)
+				}
+				h.app.load()
+				h.until("removed account", func() bool { return len(h.app.accounts) == 0 })
+			case "close":
+				h.app.Close()
+			case "body replacement":
+				r.reset(r.key)
+			}
+			select {
+			case <-cancelled:
+			case <-time.After(5 * time.Second):
+				t.Fatal("avatar context not cancelled")
+			}
+			if old.avatar != nil {
+				t.Fatal("stale avatar displayed")
+			}
+		})
+	}
+}
+
+// deliverOne delivers one message to the account's INBOX and returns its summary.
+func (h *harness) deliverOne(acc core.Account, raw []byte) core.MessageSummary {
+	h.t.Helper()
+	h.env.Deliver(h.t, acc.ID, "INBOX", raw)
+	page, err := h.env.Svc.ListMessages(context.Background(), core.View{Unified: "inbox"}, "", 200)
+	if err != nil || len(page.Items) == 0 {
+		h.t.Fatalf("no message: %v", err)
+	}
+	return page.Items[0] // newest first
+}
+
+// openThread opens a thread in the reader as a click on its row does.
+func (h *harness) openThread(id int64) {
+	h.app.mail.open([]mailItem{{ID: id, Thread: true}}, 0)
+	h.tt.Frame()
+}
+
+// openThreadWith opens thread, where only the newest message opens, and
+// opens the older messages ids too, as a click on their rows does.
+func (h *harness) openThreadWith(thread int64, ids ...int64) {
+	h.t.Helper()
+	h.openThread(thread)
+	r := h.app.mail.reader
+	h.until("the thread read", func() bool { return r.loaded && len(r.msgs) > 0 })
+	for _, id := range ids {
+		if !r.open[id] {
+			r.toggle(id)
+		}
+	}
+	h.tt.Frame()
+}
+
+func (h *harness) messages(threadID int64) []core.MessageSummary {
+	h.t.Helper()
+	th, err := h.env.Svc.GetThread(context.Background(), threadID)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return th.Messages
+}
+
+func (h *harness) countTexts(sub string) int {
+	n := 0
+	for _, s := range h.tt.Texts() {
+		if strings.Contains(s, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+// called waits for a platform call starting with prefix and returns its argument.
+func (h *harness) callArg(prefix string) string {
+	h.t.Helper()
+	var arg string
+	h.until(prefix, func() bool {
+		for _, c := range h.plat.Calls() {
+			if a, ok := strings.CutPrefix(c, prefix+" "); ok {
+				arg = a
+				return true
+			}
+		}
+		return false
+	})
+	return arg
+}
+
+func (h *harness) hasCall(prefix string) bool {
+	return slices.ContainsFunc(h.plat.Calls(), func(c string) bool { return strings.HasPrefix(c, prefix) })
+}
+
+func seen(m core.MessageSummary) bool { return slices.Contains(m.Flags, `\Seen`) }
+
+func TestReaderThreadCollapse(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc, base := accs[0], h.clock.Now()
+	h.put(acc, "INBOX", coretest.Msg("bob@example.com", acc.Email, "Plan", "first words", coretest.MessageID("a@x"), at(base, 3)))
+	h.put(acc, "INBOX", coretest.Msg("carol@example.com", acc.Email, "Re: Plan", "second words", coretest.MessageID("b@x"), coretest.InReplyTo("a@x"), at(base, 2)))
+	h.put(acc, "INBOX", coretest.Msg("dave@example.com", acc.Email, "Re: Plan", "third words", coretest.MessageID("c@x"), coretest.InReplyTo("b@x"), at(base, 1)))
+	h.syncNow(acc)
+	page, _ := h.env.Svc.ListThreads(context.Background(), core.View{Unified: "inbox"}, "", 10)
+	thread := page.Items[0].ID
+	msgs := h.messages(thread)
+	if len(msgs) != 3 {
+		t.Fatalf("%d messages in the thread", len(msgs))
+	}
+	if err := h.env.Svc.SetFlags(context.Background(), []int64{msgs[0].ID, msgs[1].ID}, []string{`\Seen`}, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.openThread(thread)
+	h.seeBody(msgs[2].ID)
+	r := h.app.mail.reader
+	if !r.open[msgs[2].ID] || r.open[msgs[0].ID] || r.open[msgs[1].ID] {
+		t.Fatalf("open %v; want only the newest", r.open)
+	}
+	if n := h.plat.openViews(); n != 1 {
+		t.Fatalf("%d body pages, want the newest's", n)
+	}
+	h.see("bob@example.com") // the collapsed rows: sender, snippet
+	h.see("second words")
+	heads := func() int { return h.countTexts("发给") / 2 } // an open header's recipients: a button, its label and its text
+	if n := heads(); n != 1 {
+		t.Fatalf("%d expanded headers, want 1: %q", n, h.tt.Texts())
+	}
+	h.click("bob@example.com")
+	h.until("the oldest expanded", func() bool { return r.open[msgs[0].ID] && heads() == 2 })
+	h.seeBody(msgs[0].ID)
+	h.click("收起") // the oldest's; its sender opens the sender's actions now
+	h.until("the oldest collapsed", func() bool {
+		return !r.open[msgs[0].ID] && heads() == 1 && h.plat.view(msgs[0].ID) == nil
+	})
+}
+
+func TestReaderThreadHistoryCollapse(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc, base := accs[0], h.clock.Now()
+	words := []string{"one", "two", "three", "four", "five", "six", "seven"}
+	for i, w := range words {
+		opts := []coretest.MsgOption{coretest.MessageID(w + "@x"), at(base, len(words)-i)}
+		if i > 0 {
+			opts = append(opts, coretest.InReplyTo(words[i-1]+"@x"))
+		}
+		h.put(acc, "INBOX", coretest.Msg("bob@example.com", acc.Email, "Plan", "msg "+w, opts...))
+	}
+	h.syncNow(acc)
+	page, _ := h.env.Svc.ListThreads(context.Background(), core.View{Unified: "inbox"}, "", 10)
+	thread := page.Items[0].ID
+	msgs := h.messages(thread)
+	if len(msgs) != 7 {
+		t.Fatalf("%d messages in the thread, want 7", len(msgs))
+	}
+	// all read but the fourth, opened besides the newest
+	var seen []int64
+	for i, m := range msgs {
+		if i != 3 {
+			seen = append(seen, m.ID)
+		}
+	}
+	if err := h.env.Svc.SetFlags(context.Background(), seen, []string{`\Seen`}, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.openThreadWith(thread, msgs[3].ID)
+	h.seeBody(msgs[6].ID)
+	r := h.app.mail.reader
+	if !r.open[msgs[3].ID] || !r.open[msgs[6].ID] || r.open[msgs[0].ID] {
+		t.Fatalf("open %v; want the fourth and the newest", r.open)
+	}
+	// the newest five kept in sight (the fourth open among them); the
+	// first and second fold into a card above them
+	h.until("the oldest a card", func() bool {
+		return h.tt.HasText("展开历史邮件（2 封）") && !h.tt.HasText("msg one") && !h.tt.HasText("msg two") &&
+			h.tt.HasText("msg three") && h.tt.HasText("msg five") && h.tt.HasText("msg six")
+	})
+	if card, _ := h.tt.Find("展开历史邮件（2 封）"); func() bool { three, _ := h.tt.Find("msg three"); return card.Y > three.Y }() {
+		t.Fatal("the card is not above the messages kept")
+	}
+
+	h.click("展开历史邮件（2 封）")
+	h.until("the oldest shown", func() bool {
+		return h.tt.HasText("msg one") && h.tt.HasText("msg two") && h.countTexts("折叠历史邮件") == 1
+	})
+	h.click("折叠历史邮件")
+	h.until("collapsed again", func() bool {
+		return h.tt.HasText("展开历史邮件（2 封）") && !h.tt.HasText("msg one")
+	})
+
+	// the threshold is how many stay in sight: 7 keeps all of 7
+	st := h.app.settings
+	st.ThreadCollapseThreshold = 7
+	h.app.changeSettings(st)
+	h.until("all kept", func() bool {
+		return !h.tt.HasText("展开历史邮件（2 封）") && h.tt.HasText("msg one") && h.tt.HasText("msg two")
+	})
+	// 6 leaves one older: a single message needs no card
+	st.ThreadCollapseThreshold = 6
+	h.app.changeSettings(st)
+	h.tt.Advance(2 * theme.MotionBase)
+	if h.tt.HasText("展开历史邮件") || !h.tt.HasText("msg one") {
+		t.Fatalf("one message carded: %q", h.tt.Texts())
+	}
+	// 3 keeps the newest three; the open fourth ends the older run
+	st.ThreadCollapseThreshold = 3
+	h.app.changeSettings(st)
+	h.until("the older carded", func() bool {
+		return h.tt.HasText("展开历史邮件（3 封）") && !h.tt.HasText("msg one") && h.tt.HasText("msg five") && h.tt.HasText("msg six")
+	})
+
+	st.ThreadCollapse = false
+	h.app.changeSettings(st)
+	h.until("collapsing off", func() bool {
+		return !h.tt.HasText("展开历史邮件") && h.tt.HasText("msg one") && h.tt.HasText("msg two")
+	})
+}
+
+// thread7 puts a thread of seven messages from bob, "msg one" to "msg
+// seven", all read: only the newest opens.
+func (h *harness) thread7(acc core.Account) []core.MessageSummary {
+	h.t.Helper()
+	base := h.clock.Now()
+	words := []string{"one", "two", "three", "four", "five", "six", "seven"}
+	for i, w := range words {
+		opts := []coretest.MsgOption{coretest.MessageID(w + "@x"), at(base, len(words)-i)}
+		if i > 0 {
+			opts = append(opts, coretest.InReplyTo(words[i-1]+"@x"))
+		}
+		h.put(acc, "INBOX", coretest.Msg("bob@example.com", acc.Email, "Plan", "msg "+w, opts...))
+	}
+	h.syncNow(acc)
+	page, _ := h.env.Svc.ListThreads(context.Background(), core.View{Unified: "inbox"}, "", 10)
+	msgs := h.messages(page.Items[0].ID)
+	ids := make([]int64, len(msgs))
+	for i, m := range msgs {
+		ids[i] = m.ID
+	}
+	if err := h.env.Svc.SetFlags(context.Background(), ids, []string{`\Seen`}, nil); err != nil {
+		h.t.Fatal(err)
+	}
+	return msgs
+}
+
+// A history card shows the whole history, one message opening in it or
+// not, and collapses it whole again, the opened one folding too; a message
+// the reader folds while it is collapsed stays in sight.
+func TestReaderHistoryKeepsShown(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	st := h.app.settings
+	st.ThreadCollapseThreshold = 2 // the newest two in sight
+	h.app.changeSettings(st)
+	msgs := h.thread7(accs[0])
+	r := h.app.mail.reader
+	h.openThread(msgs[0].ThreadID)
+	h.seeBody(msgs[6].ID)
+	h.until("the older a card", func() bool { return h.tt.HasText("展开历史邮件（5 封）") && h.tt.HasText("msg six") })
+	h.click("展开历史邮件（5 封）")
+	h.until("the older shown", func() bool { return h.tt.HasText("msg one") })
+	h.tt.Advance(2 * theme.MotionBase) // the rows in place before one is clicked
+	h.click("msg three")
+	h.until("the third open", func() bool { return r.open[msgs[2].ID] })
+	h.tt.Advance(2 * theme.MotionBase)
+	for _, w := range []string{"msg one", "msg two", "msg four", "msg five", "msg six"} {
+		if !h.tt.HasText(w) {
+			t.Fatalf("%q went back into the history: %q", w, h.tt.Texts())
+		}
+	}
+	if n := h.countTexts("折叠历史邮件"); n != 1 {
+		t.Fatalf("%d collapse cards", n)
+	}
+
+	h.click("折叠历史邮件")
+	h.tt.Advance(2 * theme.MotionBase)
+	if r.open[msgs[2].ID] || !h.tt.HasText("展开历史邮件（5 封）") || h.tt.HasText("msg one") || !h.tt.HasText("msg six") {
+		t.Fatalf("not collapsed whole (open %v): %q", r.open, h.tt.Texts())
+	}
+
+	r.expand(msgs[2].ID) // as an unread one opens
+	r.toggle(msgs[2].ID) // folded by the reader, the history collapsed
+	h.tt.Frame()
+	h.tt.Advance(2 * theme.MotionBase)
+	if !h.tt.HasText("msg three") || !h.tt.HasText("展开历史邮件（2 封）") {
+		t.Fatalf("a message folded went into the history: %q", h.tt.Texts())
+	}
+}
+
+func TestReaderMarksRead(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc, base := accs[0], h.clock.Now()
+	h.put(acc, "INBOX", coretest.Msg("bob@example.com", acc.Email, "Plan", "one", coretest.MessageID("a@x"), at(base, 2)))
+	h.put(acc, "INBOX", coretest.Msg("bob@example.com", acc.Email, "Re: Plan", "two", coretest.MessageID("b@x"), coretest.InReplyTo("a@x"), at(base, 1)))
+	h.syncNow(acc)
+	thread := h.deliverOne(acc, coretest.Msg("bob@example.com", acc.Email, "Re: Plan", "three", coretest.MessageID("c@x"), coretest.InReplyTo("b@x"))).ThreadID
+	h.openThread(thread)
+	r := h.app.mail.reader
+	h.until("the newest alone expanded", func() bool { return len(r.open) == 1 })
+	h.until("all read", func() bool {
+		return !slices.ContainsFunc(h.messages(thread), func(m core.MessageSummary) bool { return !seen(m) })
+	})
+}
+
+func TestReaderAttachments(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	data := []byte("%PDF-1.4 report body")
+	m := h.deliverOne(accs[0], coretest.Msg("bob@example.com", accs[0].Email, "Report", "see attached",
+		coretest.Attachment("report.pdf", "application/pdf", data)))
+	h.openThread(m.ThreadID)
+	h.see("report.pdf")
+	full, err := h.env.Svc.GetMessage(context.Background(), m.ID, false)
+	if err != nil || len(full.Attachments) != 1 {
+		t.Fatalf("attachments %+v, %v", full.Attachments, err)
+	}
+	h.see(byteSize(full.Attachments[0].Size))
+	h.see("PDF")
+	tmp := t.TempDir()
+	h.plat.mu.Lock()
+	h.plat.tempDir = tmp
+	h.plat.mu.Unlock()
+	h.click("report.pdf")
+	path := h.callArg("OpenPath")
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("opened %q: %q, %v", path, got, err)
+	}
+	if filepath.Base(path) != "report.pdf" || !strings.HasPrefix(path, tmp+string(filepath.Separator)) {
+		t.Fatalf("opened %q, not a report.pdf under %q", path, tmp)
+	}
+	defer func() {
+		h.app.Close()
+		if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) {
+			t.Errorf("the opened copy's directory outlived Close: %v", err)
+		}
+	}()
+	h.plat.mu.Lock()
+	h.plat.savePath = filepath.Join(t.TempDir(), "saved.pdf")
+	h.plat.mu.Unlock()
+	h.click("另存为…")
+	h.callArg("SaveFile")
+	h.until("the copy written", func() bool {
+		got, err := os.ReadFile(h.plat.savePath)
+		return err == nil && bytes.Equal(got, data)
+	})
+}
+
+// scrollTo scrolls the reader until label is in the window.
+func (h *harness) scrollTo(label string) {
+	h.t.Helper()
+	for range 500 {
+		if r, ok := h.tt.Find(label); ok && r.Y > 0 && r.Y+r.H < 820 {
+			return
+		}
+		h.tt.Scroll(900, 400, 0, 100000)
+		h.tt.Frame()
+	}
+	h.t.Fatalf("%q never came into view", label)
+}
+
+// View in browser is offered only for a body cut short: the notice's button.
+func TestViewInBrowserHasCSP(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	h.plat.tempDir = t.TempDir()
+	m := h.deliverOne(accs[0], coretest.Msg("bob@example.com", accs[0].Email, "Page", "text",
+		coretest.HTML(`<p>Shown in a browser</p><script>alert(1)</script><img src="https://tracker.example/p.gif">`)))
+	h.openThread(m.ThreadID)
+	v := h.seeBody(m.ID)
+	h.app.BodyBuilt(v, m.ID, true, false)
+	h.tt.Advance(2 * theme.MotionBase) // the message grows to hold the notice
+	h.click("在浏览器中查看")
+	u, err := url.Parse(h.callArg("OpenURL"))
+	if err != nil || u.Scheme != "file" {
+		t.Fatalf("opened %v (%v)", u, err)
+	}
+	path := filepath.FromSlash(strings.TrimPrefix(u.Path, "/"))
+	if !filepath.IsAbs(path) {
+		path = filepath.FromSlash(u.Path) // not Windows: the path starts with /
+	}
+	if !strings.HasPrefix(path, h.plat.tempDir) {
+		t.Fatalf("file %q not in the temp dir %q", path, h.plat.tempDir)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(got)
+	csp := `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">`
+	if !strings.Contains(s, csp) || strings.Contains(strings.ToLower(s), "<script") || !strings.Contains(s, "Shown in a browser") {
+		t.Fatalf("file:\n%s", s)
+	}
+}
+
+func TestReaderReplyCreatesDraft(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	m := h.deliverOne(accs[0], coretest.Msg("bob@example.com", accs[0].Email, "Question", "can you?"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.click("回复")
+	d, err := h.env.Svc.GetDraft(context.Background(), h.composeOpened(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Mode != "reply" || d.SourceMessageID != m.ID || !slices.ContainsFunc(d.To, func(s string) bool { return strings.Contains(s, "bob@example.com") }) {
+		t.Fatalf("draft %+v", d)
+	}
+}
+
+func TestReaderArchive(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	h.tt.SetPreferences(ui.Preferences{ReduceMotion: true})
+	h.app.sidebarHidden = true // its Archive folder is named as the button is
+	m := h.deliverOne(accs[0], coretest.Msg("bob@example.com", accs[0].Email, "Done", "file it"))
+	h.waitMail("the folders", func() bool { return len(h.app.mail.folders[accs[0].ID]) > 0 }) // batch finds archives by them
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.click("归档")
+	h.until("archived", func() bool { return h.countIn(h.folderOf(accs[0], "archive")) == 1 })
+	if r := h.app.route; r.ThreadID != 0 || r.MessageID != 0 {
+		t.Fatalf("the reader still shows %+v", r)
+	}
+}
+
+// A body's link (ReaderPage.OpenLink → BodyLink) asks first, showing the
+// whole address; 打开 opens it, 复制链接 copies it.
+func TestLinkConfirm(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	link := "https://shop.example.com/deal?id=7"
+	m := h.deliverOne(accs[0], coretest.Msg("bob@example.com", accs[0].Email, "Deal", "text",
+		coretest.HTML(`<p>Go to <a href="`+link+`">the deal</a> now</p>`)))
+	h.openThread(m.ThreadID)
+	v := h.seeBody(m.ID)
+	h.app.BodyLink(v, link)
+	h.tt.Frame()
+	h.see("shop.example.com")
+	h.see("/deal?id=7")
+	if h.hasCall("OpenURL") {
+		t.Fatal("opened before confirming")
+	}
+	h.click("打开")
+	if got := h.callArg("OpenURL"); got != link {
+		t.Fatalf("opened %q", got)
+	}
+	h.until("the dialog closed", func() bool { return !h.tt.HasText("复制链接") })
+
+	h.app.BodyLink(v, link)
+	h.tt.Frame()
+	h.see("复制链接")
+	h.click("复制链接")
+	if got := h.tt.Clipboard(); got != link {
+		t.Fatalf("clipboard %q", got)
+	}
+}
+
+func TestReaderRefreshKeepsNewest(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	m := h.deliverOne(accs[0], coretest.Msg("bob@example.com", accs[0].Email, "Star me", "body"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	r := h.app.mail.reader
+	fetched, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	real := r.getThread
+	r.getThread = func(ctx context.Context, id int64) (core.Thread, error) {
+		th, err := real(ctx, id)
+		if calls.Add(1) == 1 {
+			close(fetched)
+			<-release
+			defer close(returned)
+		}
+		return th, err
+	}
+	r.sync(true) // the older refresh: reads the thread unstarred, answers last
+	<-fetched
+	if err := h.env.Svc.SetFlags(context.Background(), []int64{m.ID}, []string{`\Flagged`}, nil); err != nil {
+		t.Fatal(err)
+	}
+	r.sync(true) // the newer refresh: reads it starred
+	flagged := func() bool { return len(r.msgs) == 1 && slices.Contains(r.msgs[0].Flags, `\Flagged`) }
+	h.until("the newer refresh applied", flagged)
+	close(release)
+	<-returned
+	frames := 0
+	h.until("the older answer posted and run", func() bool { frames++; return frames > 50 })
+	if !flagged() {
+		t.Fatalf("an older refresh overwrote the newer: %+v", r.msgs)
+	}
+}
+
+func TestReaderNewReplyExpandsAndReads(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	m := h.deliverOne(acc, coretest.Msg("bob@example.com", acc.Email, "Plan", "first", coretest.MessageID("p1@x"), at(h.clock.Now(), 2)))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	r := h.app.mail.reader
+	h.env.Deliver(t, acc.ID, "INBOX", coretest.Msg("carol@example.com", acc.Email, "Re: Plan", "reply words",
+		coretest.MessageID("p2@x"), coretest.InReplyTo("p1@x"), at(h.clock.Now(), 1)))
+	msgs := h.messages(m.ThreadID)
+	if len(msgs) != 2 {
+		t.Fatalf("%d messages", len(msgs))
+	}
+	reply := msgs[1].ID
+	h.waitMail("the reply expanded", func() bool { return r.open[reply] && h.plat.view(reply) != nil })
+	h.until("the reply read", func() bool { return seen(h.messages(m.ThreadID)[1]) })
+}
+
+func TestReaderSenderPopover(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	m := h.deliverOne(acc, coretest.Msg("Spammer <spammer@example.com>", acc.Email, "Spam", "buy now"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	r := h.app.mail.reader
+	if r.isBlocked("spammer@example.com") {
+		t.Fatal("unexpectedly blocked")
+	}
+
+	choose := func(item string) {
+		t.Helper()
+		h.click("spammer@example.com")
+		if !slices.Contains(h.tt.Menu(), i18n.T("reader.copy_address")) {
+			t.Fatalf("menu %q", h.tt.Menu())
+		}
+		if err := h.tt.ChooseMenuItem(item); err != nil {
+			t.Fatalf("%v; menu %q", err, h.tt.Menu())
+		}
+		h.drain()
+	}
+
+	// Blocking shows the badge at once and leaves the conversation where it is.
+	choose(i18n.T("reader.block_sender"))
+	h.until("blocked", func() bool { return r.isBlocked("Spammer <spammer@example.com>") })
+	h.see(i18n.T("reader.blocked_badge"))
+	h.see(i18n.T("reader.sender_blocked"))
+	if h.app.route.ThreadID != m.ThreadID {
+		t.Fatalf("route %+v: blocking must not move the open conversation", h.app.route)
+	}
+
+	choose(i18n.T("reader.unblock_sender"))
+	h.until("unblocked", func() bool { return !r.isBlocked("spammer@example.com") })
+	h.see(i18n.T("reader.sender_unblocked"))
+}
+
+func TestReaderBlockedBadgeOpensMenu(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	m := h.deliverOne(acc, coretest.Msg("Spammer <spammer@example.com>", acc.Email, "Spam", "buy now"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	r := h.app.mail.reader
+
+	h.click("spammer@example.com")
+	if err := h.tt.ChooseMenuItem(i18n.T("reader.block_sender")); err != nil {
+		t.Fatal(err)
+	}
+	h.until("blocked", func() bool { return r.isBlocked("spammer@example.com") })
+	h.see(i18n.T("reader.blocked_badge"))
+
+	// Clicking blocked badge opens sender menu
+	h.click(i18n.T("reader.blocked_badge"))
+	if err := h.tt.ChooseMenuItem(i18n.T("reader.unblock_sender")); err != nil {
+		t.Fatal(err)
+	}
+	h.until("unblocked", func() bool { return !r.isBlocked("spammer@example.com") })
+}
+
+func TestReaderBodyRetry(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	m := h.deliverOne(accs[0], coretest.Msg("bob@example.com", accs[0].Email, "Flaky", "eventually shown"))
+	r := h.app.mail.reader
+	var failed atomic.Bool
+	real := r.getMessage
+	r.getMessage = func(ctx context.Context, id int64, remote bool) (core.Message, error) {
+		if failed.CompareAndSwap(false, true) {
+			return core.Message{}, errors.New("server went away")
+		}
+		return real(ctx, id, remote)
+	}
+	h.openThread(m.ThreadID)
+	h.see("server went away")
+	h.click("重试")
+	h.seeBody(m.ID)
+}
+
+func TestFileName(t *testing.T) {
+	for in, want := range map[string]string{
+		"report.pdf":           "report.pdf",
+		"../../x":              "_.._x",
+		"..":                   "attachment",
+		"":                     "attachment",
+		"  ":                   "attachment",
+		"a/b\\c.txt":           "a_b_c.txt",
+		"tab\there":            "tab_here",
+		"CON":                  "_CON",
+		"con.txt":              "_con.txt",
+		"COM1.log":             "_COM1.log",
+		"console.txt":          "console.txt",
+		"trailing. . ":         "trailing",
+		"invoice\u202efdp.exe": "invoice_fdp.exe",
+	} {
+		if got := core.FileName(in, "attachment"); got != want {
+			t.Errorf("FileName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestIconExt(t *testing.T) {
+	for in, want := range map[string]string{
+		"Statement.PDF":       "pdf",
+		"archive.tar.gz":      "gz",
+		"noext":               "",
+		"x.":                  "",
+		"x.../../a":           "",
+		"x.p d f":             "",
+		"x.pdf\u202e":         "",
+		"x.abcdefghijk":       "",
+		"x.docx":              "docx",
+		"photo.\u00e9t\u00e9": "",
+	} {
+		if got := iconExt(in); got != want {
+			t.Errorf("iconExt(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSingleMessageHeadDoesNotCollapse(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	m := h.deliverOne(acc, coretest.Msg("bob@example.com", acc.Email, "Plan", "only words"))
+	h.openThread(m.ThreadID)
+	v := h.seeBody(m.ID)
+	var head string // the sender head's "发给 …" line, which only the reader shows
+	for _, s := range h.tt.Texts() {
+		if strings.HasPrefix(s, "发给") {
+			head = s
+		}
+	}
+	if head == "" {
+		t.Fatalf("no sender head: %q", h.tt.Texts())
+	}
+	h.click(head)
+	h.tt.Frame()
+	if _, shown := h.viewBox(v); !h.app.mail.reader.open[m.ID] || !shown || v.closed {
+		t.Fatal("a click on the only message's head collapsed it")
+	}
+}
+
+// A draft created after the user switched mail still opens: its window
+// does not cover the reader.
+func TestReplyAfterSwitchingMailOpensWindow(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	m := h.deliverOne(accs[0], coretest.Msg("bob@example.com", accs[0].Email, "Question", "can you?"))
+	other := h.deliverOne(accs[0], coretest.Msg("carol@example.com", accs[0].Email, "Other", "other body"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	if err := h.tt.Click("回复"); err != nil { // no drain: the draft's callback waits
+		t.Fatal(err)
+	}
+	h.openThread(other.ThreadID)
+	if d := h.draft(h.composeOpened(0)); d.Mode != "reply" || d.SourceMessageID != m.ID {
+		t.Fatalf("draft %+v", d)
+	}
+}
+
+func TestRelativeSenderDate(t *testing.T) {
+	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC) // a Wednesday
+	for _, c := range []struct {
+		t    time.Time
+		want string
+	}{
+		{time.Date(2026, 10, 14, 9, 41, 0, 0, time.UTC), "今天 09:41"},
+		{time.Date(2026, 10, 13, 18, 5, 0, 0, time.UTC), "昨天 18:05"},
+		{time.Date(2026, 10, 12, 7, 30, 0, 0, time.UTC), "周一 07:30"},
+		{time.Date(2026, 10, 2, 7, 30, 0, 0, time.UTC), "10/02 07:30"},
+	} {
+		if got := senderDate(now, c.t); got != c.want {
+			t.Errorf("senderDate(%v) = %q, want %q", c.t, got, c.want)
+		}
+	}
+
+	diffYear := time.Date(2025, 10, 2, 7, 30, 0, 0, time.UTC)
+	if got := senderDate(now, diffYear); got != "2025/10/02 07:30" {
+		t.Errorf("senderDate diffYear = %q, want %q", got, "2025/10/02 07:30")
+	}
+
+	t.Cleanup(func() { i18n.SetLanguage("zh-CN") })
+	i18n.SetLanguage("de")
+	for _, c := range []struct {
+		t    time.Time
+		want string
+	}{
+		{time.Date(2026, 10, 14, 9, 41, 0, 0, time.UTC), "Heute 09:41"},
+		{time.Date(2026, 10, 13, 18, 5, 0, 0, time.UTC), "Gestern 18:05"},
+		{time.Date(2026, 10, 12, 7, 30, 0, 0, time.UTC), "Mo. 07:30"},
+		{time.Date(2026, 10, 2, 7, 30, 0, 0, time.UTC), "02.10. 07:30"},
+		{diffYear, "02.10.2025 07:30"},
+	} {
+		if got := senderDate(now, c.t); got != c.want {
+			t.Errorf("de senderDate(%v) = %q, want %q", c.t, got, c.want)
+		}
+	}
+}
+
+// TestReaderToolbarAt16: the toolbar's buttons fit the window, unclipped and
+// apart, at font 13 and 16.
+func TestReaderToolbarAt16(t *testing.T) {
+	for _, font := range []int{13, 16} {
+		t.Run(strconv.Itoa(font), func(t *testing.T) {
+			h, acc, _ := aiHarness(t, true, noQuick)
+			h.setSettings(func(s *core.Settings) { s.FontSize = font })
+			m := h.deliverOne(acc, coretest.Msg("bob@example.com", acc.Email, "Plan", "body"))
+			h.openThread(m.ThreadID)
+			h.seeBody(m.ID)
+			var prev ui.Rect
+			for i, label := range []string{"回复", "全部回复", "转发", "归档", "删除", "总结", "翻译"} {
+				r, ok := h.tt.Find(label)
+				if !ok {
+					t.Fatalf("no %q", label)
+				}
+				if r.X < 0 || r.X+r.W > 1280 || r.Y < 0 {
+					t.Errorf("font %d: %q clipped: %+v", font, label, r)
+				}
+				if i > 0 && r.Y == prev.Y && r.X < prev.X+prev.W {
+					t.Errorf("font %d: %q overlaps the one before: %+v over %+v", font, label, r, prev)
+				}
+				prev = r
+			}
+		})
+	}
+}
+
+func TestReaderJunk(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	if err := h.env.IMAP(accs[0].ID).User.Create("Junk", nil); err != nil {
+		t.Fatal(err)
+	}
+	m := h.deliverOne(accs[0], coretest.Msg("bob@example.com", accs[0].Email, "Win", "a prize"))
+	h.waitMail("the junk folder", func() bool {
+		return slices.ContainsFunc(h.app.mail.folders[accs[0].ID], func(f core.Folder) bool { return f.Role == "junk" })
+	})
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.click("移到垃圾邮件")
+	h.until("in junk", func() bool { return h.countIn(h.folderOf(accs[0], "junk")) == 1 })
+	if r := h.app.route; r.ThreadID != 0 || r.MessageID != 0 {
+		t.Fatalf("the reader still shows %+v", r)
+	}
+}
+
+// An account without a junk folder is skipped and named; nothing moves.
+func TestReaderJunkWithoutFolder(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	m := h.deliverOne(accs[0], coretest.Msg("bob@example.com", accs[0].Email, "Win", "a prize"))
+	h.waitMail("the folders", func() bool { return len(h.app.mail.folders[accs[0].ID]) > 0 })
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.click("移到垃圾邮件")
+	h.see("alice@example.com 没有垃圾邮件文件夹，已跳过")
+	if h.countIn(h.folderOf(accs[0], "inbox")) != 1 {
+		t.Fatal("the message moved")
+	}
+}
+
+// Inside a junk folder 移到垃圾邮件 is not offered; elsewhere it is.
+func TestJunkActionNotInJunk(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	if err := h.env.IMAP(acc.ID).User.Create("Junk", nil); err != nil {
+		t.Fatal(err)
+	}
+	m := h.deliverOne(acc, coretest.Msg("bob@example.com", acc.Email, "Hi", "x"))
+	h.openThread(m.ThreadID)
+	h.see("移到垃圾邮件")
+	f := h.folderOf(acc, "junk")
+	h.post(func() { h.app.navigate(Route{Page: PageMail, View: core.View{FolderID: f.ID}}) })
+	h.until("the junk folder", func() bool { return h.app.mail.view.FolderID == f.ID && !h.app.mail.loading })
+	h.openThread(m.ThreadID)
+	h.see("回复")
+	if h.tt.HasText("移到垃圾邮件") {
+		t.Fatal("移到垃圾邮件 inside Junk")
+	}
+}
+
+func TestReaderMoveToInbox(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	m := h.deliverOne(acc, coretest.Msg("bob@example.com", acc.Email, "In Archive", "content"))
+	f := h.folderOf(acc, "archive")
+	if err := h.env.Svc.MoveToRole(context.Background(), []int64{m.ID}, "archive"); err != nil {
+		t.Fatal(err)
+	}
+	h.post(func() { h.app.navigate(Route{Page: PageMail, View: core.View{FolderID: f.ID}}) })
+	h.until("the archive folder", func() bool { return h.app.mail.view.FolderID == f.ID && !h.app.mail.loading })
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.click(i18n.T("mail.action.inbox"))
+	h.until("in inbox", func() bool { return h.countIn(h.folderOf(acc, "inbox")) == 1 })
+	if r := h.app.route; r.ThreadID != 0 || r.MessageID != 0 {
+		t.Fatalf("the reader still shows %+v", r)
+	}
+}
+
+func TestReaderAvatarMoveToJunk(t *testing.T) {
+	h, acc := avatarHarness(t, "auto", func(w http.ResponseWriter, r *http.Request) { w.Write(readerAvatarSVG) })
+	if err := h.env.IMAP(acc.ID).User.Create("Junk", nil); err != nil {
+		t.Fatal(err)
+	}
+	h.syncNow(acc)
+	m := h.deliverOne(acc, coretest.Msg("Bob <bob@example.com>", acc.Email, "Avatar", "plain"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	r := h.app.mail.reader
+	h.until("initial avatar", func() bool { return r.bodies[m.ID].avatar != nil })
+	h.advance(refreshEvery)
+	h.until("settled avatar", func() bool { return r.bodies[m.ID].avatar != nil })
+	if err := h.env.Svc.MoveToRole(t.Context(), []int64{m.ID}, "junk"); err != nil {
+		t.Fatal(err)
+	}
+	h.app.refresh(nil)
+	h.until("moved message summary", func() bool { return len(r.msgs) == 1 && r.msgs[0].FolderID != m.FolderID })
+	allowed, err := h.env.Svc.ImagesAllowed(t.Context(), m.ID)
+	if err != nil || allowed {
+		t.Fatalf("junk policy allowed=%v err=%v", allowed, err)
+	}
+	if r.bodies[m.ID].avatar != nil {
+		t.Fatal("automatic avatar remains displayed after same message moves to Junk")
+	}
+	b := r.bodies[m.ID]
+	h.see("1 张图片未加载")
+	h.until("junk body metadata", func() bool { return b.msg.InJunk && !b.trusted && !b.loading })
+	if b.msg.RemoteImagesBlocked != 0 || h.tt.HasText("始终信任此发件人") {
+		t.Fatal("junk notice has stale body policy")
+	}
+	h.click("加载")
+	h.until("manual junk avatar", func() bool { return b.avatar != nil && b.avatarAllow && b.allow })
+	h.app.refresh(nil)
+	h.until("same-message refresh", func() bool { return !h.app.mail.loading })
+	if !b.avatarAllow || b.avatar == nil {
+		t.Fatal("refresh revoked current-message manual permission")
+	}
+	if err := h.env.Svc.Move(t.Context(), []int64{m.ID}, m.FolderID); err != nil {
+		t.Fatal(err)
+	}
+	h.app.refresh(nil)
+	h.until("back in inbox", func() bool { return b.msg.FolderID == m.FolderID && !b.msg.InJunk && b.trusted && b.avatar != nil })
+	if !b.avatarAllow || !b.allow {
+		t.Fatal("folder move lost current-message permission")
+	}
+	// A fresh reader generation drops the manual grant; moving back then loads automatically.
+	h.post(func() { r.reset(r.key); r.load() })
+	h.until("fresh automatic inbox avatar", func() bool { b = r.bodies[m.ID]; return b != nil && b.avatar != nil && !b.avatarAllow })
+	for _, role := range []string{"junk", "inbox"} {
+		folder := h.folderOf(acc, role)
+		if err := h.env.Svc.Move(t.Context(), []int64{m.ID}, folder.ID); err != nil {
+			t.Fatal(err)
+		}
+		h.app.refresh(nil)
+		if role == "junk" {
+			h.until("automatic avatar revoked again", func() bool { return b.msg.InJunk && b.avatar == nil && b.avatarBlocked })
+		} else {
+			h.until("automatic avatar restored", func() bool { return !b.msg.InJunk && b.avatar != nil && !b.avatarAllow })
+		}
+	}
+}
+
+func TestReaderAvatarMoveDropsOldBodyRead(t *testing.T) {
+	h, acc := avatarHarness(t, "auto", func(w http.ResponseWriter, r *http.Request) { w.Write(readerAvatarSVG) })
+	if err := h.env.IMAP(acc.ID).User.Create("Junk", nil); err != nil {
+		t.Fatal(err)
+	}
+	h.syncNow(acc)
+	m := h.deliverOne(acc, coretest.Msg("Bob <bob@example.com>", acc.Email, "Avatar", "plain"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	r := h.app.mail.reader
+	b := r.bodies[m.ID]
+	h.until("automatic avatar", func() bool { return b.avatar != nil })
+	started, release, finished := make(chan struct{}), make(chan struct{}, 1), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	get := r.getMessage
+	var calls atomic.Int64
+	r.getMessage = func(ctx context.Context, id int64, remote bool) (core.Message, error) {
+		msg, err := get(ctx, id, remote)
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+			close(finished)
+		}
+		return msg, err
+	}
+	h.post(func() { r.loadBody(m.ID) })
+	h.until("old body read pending", func() bool {
+		select {
+		case <-started:
+			return true
+		default:
+			return false
+		}
+	})
+	if err := h.env.Svc.MoveToRole(t.Context(), []int64{m.ID}, "junk"); err != nil {
+		t.Fatal(err)
+	}
+	h.app.refresh(nil)
+	h.until("current junk policy", func() bool { return b.msg.InJunk && !b.loading && b.avatar == nil && b.avatarBlocked })
+	h.see("1 张图片未加载")
+	release <- struct{}{}
+	<-finished
+	h.queued("old body callback", 1)
+	h.drain()
+	if !b.msg.InJunk || b.msg.FolderID == m.FolderID || b.trusted || b.avatar != nil {
+		t.Fatal("old body read restored pre-move metadata or avatar")
+	}
+}
+
+func TestReaderSaveAndPrint(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	m := h.deliverOne(acc, coretest.Msg("bob@example.com", acc.Email, "Save and Print Test", "Body contents here"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+
+	tmp := t.TempDir()
+	savePath := filepath.Join(tmp, "test-saved.eml")
+
+	// 1. Save in the toolbar
+	h.plat.mu.Lock()
+	h.plat.savePath = savePath
+	h.plat.mu.Unlock()
+
+	// Save and print sit in the toolbar's more menu.
+	choose := func(item string) {
+		t.Helper()
+		h.click(i18n.T("reader.more"))
+		if err := h.tt.ChooseMenuItem(item); err != nil {
+			t.Fatalf("%v; menu %q", err, h.tt.Menu())
+		}
+		h.drain()
+	}
+	choose(i18n.T("reader.save"))
+	arg := h.callArg("SaveFile")
+	if !strings.HasSuffix(arg, ".eml") {
+		t.Fatalf("expected .eml default name, got %q", arg)
+	}
+	h.until("mail saved to disk", func() bool {
+		data, err := os.ReadFile(savePath)
+		return err == nil && len(data) > 0
+	})
+
+	// 2. Print in the toolbar
+	choose(i18n.T("reader.print"))
+	printArg := h.callArg("Print")
+	if printArg != fmt.Sprint(m.ID) {
+		t.Fatalf("expected Print call for message %d, got %q", m.ID, printArg)
+	}
+
+	// 3. Cmd+S shortcut
+	savePath2 := filepath.Join(tmp, "shortcut-saved.eml")
+	h.plat.mu.Lock()
+	h.plat.savePath = savePath2
+	h.plat.calls = nil
+	h.plat.mu.Unlock()
+
+	h.tt.Key(ui.Cmd, ui.KeyS)
+	h.drain()
+	h.until("shortcut mail saved", func() bool {
+		data, err := os.ReadFile(savePath2)
+		return err == nil && len(data) > 0
+	})
+
+	// 4. Cmd+P shortcut
+	h.plat.mu.Lock()
+	h.plat.calls = nil
+	h.plat.mu.Unlock()
+
+	h.tt.Key(ui.Cmd, ui.KeyP)
+	h.drain()
+	printArg2 := h.callArg("Print")
+	if printArg2 != fmt.Sprint(m.ID) {
+		t.Fatalf("expected Print call via shortcut for %d, got %q", m.ID, printArg2)
+	}
+
+	// 5. BodySave and BodyPrint via native webview callbacks
+	view := h.plat.view(m.ID)
+	if view == nil {
+		t.Fatal("expected non-nil body view")
+	}
+
+	savePath3 := filepath.Join(tmp, "body-saved.eml")
+	h.plat.mu.Lock()
+	h.plat.savePath = savePath3
+	h.plat.calls = nil
+	h.plat.mu.Unlock()
+
+	h.app.BodySave(view)
+	h.until("body save completed", func() bool {
+		data, err := os.ReadFile(savePath3)
+		return err == nil && len(data) > 0
+	})
+
+	h.app.BodyPrint(view)
+	printArg3 := h.callArg("Print")
+	if printArg3 != fmt.Sprint(m.ID) {
+		t.Fatalf("expected BodyPrint call for %d, got %q", m.ID, printArg3)
+	}
+}
+
+func TestReaderPrintFocusedMessage(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc, base := accs[0], h.clock.Now()
+	h.put(acc, "INBOX", coretest.Msg("bob@example.com", acc.Email, "Plan", "first words", coretest.MessageID("a@x"), at(base, 2)))
+	h.put(acc, "INBOX", coretest.Msg("carol@example.com", acc.Email, "Re: Plan", "second words", coretest.MessageID("b@x"), coretest.InReplyTo("a@x"), at(base, 1)))
+	h.syncNow(acc)
+	page, _ := h.env.Svc.ListThreads(context.Background(), core.View{Unified: "inbox"}, "", 10)
+	msgs := h.messages(page.Items[0].ID)
+	if err := h.env.Svc.SetFlags(context.Background(), []int64{msgs[0].ID}, []string{`\Seen`}, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.openThread(page.Items[0].ID)
+	h.seeBody(msgs[1].ID)
+	r := h.app.mail.reader
+	print := func(want int64, do func()) {
+		t.Helper()
+		h.plat.mu.Lock()
+		h.plat.calls = nil
+		h.plat.mu.Unlock()
+		do()
+		h.drain()
+		if got := h.callArg("Print"); got != fmt.Sprint(want) {
+			t.Fatalf("printed %s, want %d", got, want)
+		}
+	}
+	key := func() { h.tt.Key(ui.Cmd, ui.KeyP) }
+
+	print(msgs[1].ID, key) // nothing focused: the newest
+	h.click("bob@example.com")
+	h.seeBody(msgs[0].ID)
+	print(msgs[0].ID, key) // the one just expanded
+	print(msgs[1].ID, func() { h.app.BodyPrint(h.plat.view(msgs[1].ID)) })
+	print(msgs[1].ID, key) // the page that took ⌘P keeps the focus
+	r.toggle(msgs[1].ID)   // the focused one folded: the newest expanded
+	print(msgs[0].ID, key)
+}
+
+// The header names who a message went to: "我" with one account; with more,
+// the address that got it, the others (To and Cc) counted; under Cc when the
+// user is only Cc'd; To's first when the user is in neither; the account's
+// address when the message names no one.
+func TestReaderRecipients(t *testing.T) {
+	h, accs := mailHarness(t, nil, "me@baran.wang", "work@company.example")
+	h.waitMail("the folders", func() bool { return len(h.app.mail.folders[accs[0].ID]) > 0 })
+	inbox := h.app.mail.folders[accs[0].ID][0].ID
+	r := h.app.mail.reader
+	for _, c := range []struct {
+		to, cc []string
+		want   string
+	}{
+		{to: []string{"Baran <me@baran.wang>"}, want: "发给 me@baran.wang"},
+		{to: []string{"Baran <me@baran.wang>", "Mia <mia@partner.example>"}, cc: []string{"team@partner.example", "ops@partner.example"}, want: "发给 me@baran.wang 等 3 人"},
+		{to: []string{"Lena Park <lena@partner.example>", "mia@partner.example", "joe@partner.example"}, cc: []string{"Work <WORK@company.example>"}, want: "发给 Lena Park 等 2 人 · 抄送 WORK@company.example"},
+		{to: []string{"subscribers@rust.example"}, cc: []string{"x@rust.example"}, want: "发给 subscribers@rust.example 等 1 人"},
+		{cc: []string{"Team <team@partner.example>"}, want: "抄送 Team"},
+		{want: "发给 me@baran.wang"},
+	} {
+		if got := r.recipients(core.MessageSummary{FolderID: inbox, To: c.to, Cc: c.cc}); got != c.want {
+			t.Errorf("to %q cc %q: %q, want %q", c.to, c.cc, got, c.want)
+		}
+	}
+}
+
+// With one account the user is "我", or their sidebar name when an alias is
+// set; a digest's citation names the user's own mail the same way.
+func TestReaderRecipientsOneAccount(t *testing.T) {
+	h, accs := mailHarness(t, nil, "me@baran.wang")
+	r := h.app.mail.reader
+	got := core.MessageSummary{To: []string{"Baran <me@baran.wang>"}, Cc: []string{"mia@partner.example"}}
+	sent := core.MessageSummary{From: "Baran <me@baran.wang>", Date: h.app.clock.Now()}
+	if s := r.recipients(got); s != "发给 我 等 1 人" {
+		t.Fatalf("one account without alias: %q", s)
+	}
+	if s := r.sourceLabel(sent); !strings.HasSuffix(s, " · 我") {
+		t.Fatalf("source without alias: %q", s)
+	}
+	alias := "Peter"
+	if _, err := h.env.Svc.UpdateAccount(context.Background(), accs[0].ID, core.AccountPatch{Alias: &alias}); err != nil {
+		t.Fatal(err)
+	}
+	h.waitMail("the alias", func() bool { return h.app.accounts[0].Alias == alias })
+	if s := r.recipients(got); s != "发给 Peter 等 1 人" {
+		t.Fatalf("one account with alias: %q", s)
+	}
+	if s := r.sourceLabel(sent); !strings.HasSuffix(s, " · Peter") {
+		t.Fatalf("source with alias: %q", s)
+	}
+}
+
+// The recipients' line opens the message's details: who sent it, to whom,
+// when; the account only with more than one.
+func TestReaderRecipientDetails(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	m := h.deliverOne(accs[0], coretest.Msg("Bob <bob@example.com>", accs[0].Email, "Plan", "body",
+		coretest.Date(time.Date(2026, 10, 5, 14, 30, 0, 0, time.Local))))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	if h.tt.HasText("收件人") {
+		t.Fatal("the details show before the line is clicked")
+	}
+	h.click("发给 我")
+	h.see("发件人")
+	h.see("收件人")
+	h.see("日期")
+	h.see("2026/10/05 周一 14:30") // with the year and the weekday
+	if h.tt.HasText("收件账户") {
+		t.Fatal("the account shows with one account")
+	}
+}
+
+// A value too long for the details is cut to one line: whole on hover, and
+// a selection of it copies it whole.
+func TestReaderRecipientDetailsLong(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	full := "godwit-email/godwit <reply+ACXF7WOQ23XZUOXFVFDM3ADLLACSDEVBNHHQAAAAAFTYZGXK@reply.github.com>"
+	m := h.deliverOne(accs[0], coretest.Msg("Bob <bob@example.com>", accs[0].Email, "Plan", "body", coretest.Header("Reply-To: "+full)))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.click("发给 我")
+	h.see(full) // its text; it shows cut
+	e, _ := h.tt.Find(full)
+	h.tt.Move(e.X+e.W/2, e.Y+e.H/2)
+	h.tt.Advance(900 * time.Millisecond)
+	if n := h.countTexts(full); n != 2 {
+		t.Fatalf("%d texts of the value on hover, want it and its tooltip", n)
+	}
+	for range 3 { // a triple click selects its line, as much as shows
+		h.tt.ClickAt(e.X+e.W/4, e.Y+e.H/2)
+	}
+	h.tt.Key(ui.Cmd, ui.KeyC)
+	h.tt.Frame()
+	if got := h.tt.Clipboard(); got != full {
+		t.Fatalf("copied %q", got)
+	}
+}
+
+// hover rests the pointer on the element labelled label until its hover card shows.
+func (h *harness) hover(label string) {
+	h.t.Helper()
+	h.until(fmt.Sprintf("an element %q", label), func() bool { _, ok := h.tt.Find(label); return ok })
+	r, _ := h.tt.Find(label)
+	h.tt.Move(r.X+r.W/2, r.Y+r.H/2)
+	h.tt.Advance(900 * time.Millisecond)
+}
+
+func TestReaderSecuritySpoofingWarning(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	// Deliver spoofed email claiming to be PayPal but sent from gmail.com
+	m := h.deliverOne(acc, coretest.Msg("\"PayPal Support\" <phisher@gmail.com>", acc.Email, "Urgent Notice", "Verify your account"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.hover(i18n.T("reader.security.fraud_badge"))
+	h.see(i18n.T("reader.security.spoof_brand"))
+
+	// Switch off SecurityWarnings in settings: warning disappears
+	st := h.app.settings
+	st.SecurityWarnings = false
+	h.app.changeSettings(st)
+	h.until("warnings disabled", func() bool { return !h.app.settings.SecurityWarnings })
+	h.openThread(m.ThreadID)
+	if _, ok := h.tt.Find(i18n.T("reader.security.fraud_badge")); ok {
+		t.Fatal("warning badge should be hidden when SecurityWarnings is off")
+	}
+}
+
+func TestReaderSecurityNeedsReviewCard(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	m := h.deliverOne(acc, coretest.Msg("\"Billing Dept\" <billing@unknown-shop.com>", acc.Email, "Notice", "Payment notice"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.app.mail.reader.bodies[m.ID].msg.Security = gomail.SecurityReport{Status: gomail.SecurityNeedsReview, ActualDomain: "unknown-shop.com", DKIMPass: true}
+	h.hover(i18n.T("reader.security.review_badge"))
+	h.see(i18n.Tf("reader.security.review_authenticated_desc", "unknown-shop.com"))
+}
+
+// Unverified mail, and mail not checked yet, shows no badge at all.
+func TestReaderSecurityNeutralNoBadge(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	m := h.deliverOne(acc, coretest.Msg("\"Friend\" <friend@example.org>", acc.Email, "Hi", "Hello"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	if h.tt.HasText(i18n.T("reader.security.unverified_badge")) {
+		t.Fatal("neutral sender shows a badge")
+	}
+}
+
+func TestReaderSecurityCertifiedBrandCard(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	m := h.deliverOne(acc, coretest.Msg("\"Sparkasse\" <sicherheit@sparkasse.de>", acc.Email, "Kontoauszug", "Hier Ihr Auszug",
+		coretest.Header("Authentication-Results: mx.example.com; dkim=pass header.i=@sparkasse.de; dmarc=pass header.from=sparkasse.de; bimi=pass")))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	// The badge UI consumes a validated verdict; arbitrary bimi=pass headers cannot create one.
+	h.app.mail.reader.bodies[m.ID].msg.Security = gomail.SecurityReport{Status: gomail.SecurityCertifiedBrand}
+	h.hover(i18n.T("reader.security.certified_badge"))
+	h.see(i18n.T("reader.security.certified_desc"))
+}
+
+func TestReaderSecurityVerifiedDomainCard(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	raw := append([]byte("Authentication-Results: mx.example.com; dkim=pass header.i=@sparkasse.de; dmarc=pass header.from=sparkasse.de\r\nReceived: from sender.invalid by mx.example.com; Thu, 29 Oct 2026 00:00:00 +0000\r\n"), coretest.Msg("\"Sparkasse\" <sicherheit@sparkasse.de>", acc.Email, "Kontoauszug", "Hier Ihr Auszug")...)
+	m := h.deliverOne(acc, raw)
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	h.hover(i18n.T("reader.security.verified_badge"))
+	h.see(i18n.T("reader.security.verified_desc"))
+}
+
+func TestReaderSecurityManualAdjustment(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	m := h.deliverOne(acc, coretest.Msg("\"Example Shop\" <shop@example.com>", acc.Email, "Order Confirmation", "Thank you for your order"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+
+	// 1. Manually mark safe
+	h.app.mail.reader.applySecurity(m.ID, "manual_safe")
+	h.until("manual safe applied", func() bool {
+		return h.app.mail.reader.msgs[0].Security.Reason == "manual_safe"
+	})
+	h.hover(i18n.T("reader.security.manual_safe_badge"))
+	h.see(i18n.T("reader.security.manual_safe_desc"))
+
+	// 2. Manually mark warning / threat
+	h.app.mail.reader.applySecurity(m.ID, "manual_warning")
+	h.until("manual warning applied", func() bool {
+		return h.app.mail.reader.msgs[0].Security.Reason == "manual_warning"
+	})
+	h.hover(i18n.T("reader.security.manual_warning_badge"))
+	h.see(i18n.T("reader.security.manual_warning_desc"))
+
+	// 3. Reset security classification
+	h.app.mail.reader.applySecurity(m.ID, "")
+	h.until("security reset", func() bool {
+		return h.app.mail.reader.msgs[0].Security.Reason == ""
+	})
+
+	// 4. Test mailPage toggleLabel and applySecurity
+	lbl, err := h.app.svc.CreateLabel(t.Context(), core.LabelInput{Name: "Finance", Color: "green", Icon: "money-dollar-circle"})
+	if err != nil {
+		t.Fatalf("CreateLabel: %v", err)
+	}
+	item := mailItem{ID: m.ID, Thread: false}
+	h.app.mail.toggleLabel([]mailItem{item}, lbl.ID, true)
+	h.until("label applied", func() bool {
+		lbs, err := h.app.svc.MessageLabels(t.Context(), []int64{m.ID})
+		return err == nil && len(lbs[m.ID]) > 0 && lbs[m.ID][0].LabelID == lbl.ID
+	})
+
+	h.app.mail.applySecurity([]mailItem{item}, "manual_suspicious")
+	h.until("mailPage applySecurity", func() bool {
+		th, err := h.app.svc.GetThread(t.Context(), m.ThreadID)
+		return err == nil && len(th.Messages) > 0 && th.Messages[0].Security.Reason == "manual_suspicious"
+	})
+
+	// 5. The badge's menu sets the classification
+	r := h.app.mail.reader
+	r.applySecurity(m.ID, "manual_suspicious")
+	h.click(i18n.T("reader.security.manual_suspicious_badge"))
+	menu := h.tt.Menu()
+	for _, want := range []string{"mail.security.mark_safe", "mail.security.mark_suspicious", "mail.security.mark_warning", "mail.security.reset"} {
+		if !slices.Contains(menu, i18n.T(want)) {
+			t.Fatalf("no %s in menu %q", want, menu)
+		}
+	}
+	if err := h.tt.ChooseMenuItem(i18n.T("mail.security.mark_safe")); err != nil {
+		t.Fatalf("%v; menu %q", err, menu)
+	}
+	h.drain()
+	h.until("the badge's choice", func() bool {
+		th, err := h.app.svc.GetThread(t.Context(), m.ThreadID)
+		return err == nil && len(th.Messages) > 0 && th.Messages[0].Security.Reason == "manual_safe"
+	})
+
+	// 6. The sender's menu has the same submenus as a mail row's
+	h.until("the labels", func() bool { return len(h.app.labels) > 0 })
+	chooseSender := func(path ...string) {
+		t.Helper()
+		h.click("shop@example.com")
+		if err := h.tt.ChooseMenuItem(path...); err != nil {
+			t.Fatalf("%v; menu %q", err, h.tt.Menu())
+		}
+		h.drain()
+	}
+	chooseSender(i18n.T("mail.menu.security"), i18n.T("mail.security.mark_warning"))
+	h.until("the sender menu's classification", func() bool {
+		th, err := h.app.svc.GetThread(t.Context(), m.ThreadID)
+		return err == nil && len(th.Messages) > 0 && th.Messages[0].Security.Reason == "manual_warning"
+	})
+	first := h.app.labels[0]
+	on := func() bool {
+		return slices.ContainsFunc(r.labels, func(l core.AppliedLabel) bool { return l.LabelID == first.ID })
+	}
+	wasOn := on()
+	chooseSender(i18n.T("mail.menu.labels"), first.Name)
+	if on() == wasOn {
+		t.Fatalf("label %q still %v on %+v", first.Name, wasOn, r.labels)
+	}
+}
+
+// The reply box names who a reply goes to: the sender, or for the user's own
+// mail its first recipient, not the user.
+func TestReaderReplyNameRecipients(t *testing.T) {
+	h, accounts := mailHarness(t, nil, "me@example.com")
+	h.waitMail("the folders", func() bool { return len(h.app.mail.folders[accounts[0].ID]) > 0 })
+	folderID := h.app.mail.folders[accounts[0].ID][0].ID
+	reader := h.app.mail.reader
+	for _, scenario := range []struct {
+		name    string
+		from    string
+		to      []string
+		replyTo string
+		want    string
+	}{
+		{name: "self first", from: "Me <me@example.com>", to: []string{"Me <me@example.com>", "Recipient <recipient@example.com>"}, want: "Recipient"},
+		{name: "own mail with external reply-to", from: "Me <me@example.com>", to: []string{"Recipient <recipient@example.com>"}, replyTo: "Support <support@example.com>", want: "Support"},
+		{name: "own mail with self reply-to", from: "Me <me@example.com>", to: []string{"Me <me@example.com>", "Recipient <recipient@example.com>"}, replyTo: "Me <me@example.com>", want: "Recipient"},
+		{name: "incoming mail with reply-to", from: "Recipient <recipient@example.com>", to: []string{"me@example.com"}, replyTo: "Support <support@example.com>", want: "Support"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			message := core.Message{
+				MessageSummary: core.MessageSummary{ID: 1, FolderID: folderID, From: scenario.from, To: scenario.to},
+				ReplyTo:        scenario.replyTo,
+			}
+			reader.bodies[message.ID] = &msgBody{msg: message, ready: true}
+			if got := reader.replyName(message.MessageSummary); got != scenario.want {
+				t.Errorf("reply name %q, want %q", got, scenario.want)
+			}
+		})
+	}
+}
+
+func TestReaderReplyName(t *testing.T) {
+	h, accs := mailHarness(t, nil, "me@baran.wang")
+	h.waitMail("the folders", func() bool { return len(h.app.mail.folders[accs[0].ID]) > 0 })
+	inbox := h.app.mail.folders[accs[0].ID][0].ID
+	r := h.app.mail.reader
+	for _, c := range []struct {
+		from string
+		to   []string
+		want string
+	}{
+		{from: "Lena Park <lena@partner.example>", to: []string{"me@baran.wang"}, want: "Lena Park"},
+		{from: "Baran <ME@baran.wang>", to: []string{"Julie <julie@partner.example>", "mia@partner.example"}, want: "Julie"},
+		{from: "Baran <me@baran.wang>", want: "Baran"}, // no recipients to name
+	} {
+		if got := r.replyName(core.MessageSummary{FolderID: inbox, From: c.from, To: c.to}); got != c.want {
+			t.Errorf("from %q to %q: %q, want %q", c.from, c.to, got, c.want)
+		}
+	}
+}
+
+// TestReplySkipsOwnForward: the reader and the list answer the conversation,
+// not the recipient of the user's own forward in it, but forward that forward
+// again; read alone, it still answers its recipient.
+func TestReplySkipsOwnForward(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc, base := accs[0], h.clock.Now()
+	h.put(acc, "INBOX", coretest.Msg("bob@example.com", acc.Email, "Plan", "first words", coretest.MessageID("o@x"), at(base, 2)))
+	h.put(acc, "Sent", coretest.Msg(acc.Email, "carol@example.com", "Fwd: Plan", "forward words", coretest.MessageID("f@x"), coretest.Header("References: <o@x>"), at(base, 1)))
+	h.syncNow(acc)
+	h.waitMail("the thread", func() bool { return len(h.items()) == 1 })
+	item := h.items()[0]
+	msgs := h.messages(item.ID)
+	if len(msgs) != 2 {
+		t.Fatalf("%d messages in the thread", len(msgs))
+	}
+
+	var last int64
+	wantTo := func(what string, want string, open func()) {
+		t.Helper()
+		h.post(open)
+		last = h.composeOpened(last)
+		if to := h.draft(last).To; len(to) != 1 || to[0] != want {
+			t.Errorf("%s: To = %v, want %s", what, to, want)
+		}
+	}
+	wantTo("list", "bob@example.com", func() { h.app.mail.draft(item, "reply") })
+	wantForward := func(what string, open func()) {
+		t.Helper()
+		h.post(open)
+		last = h.composeOpened(last)
+		if src := h.draft(last).SourceMessageID; src != msgs[1].ID {
+			t.Errorf("%s: forward of %d, want the newest, %d: it holds what the user added", what, src, msgs[1].ID)
+		}
+	}
+	wantForward("list", func() { h.app.mail.draft(item, "forward") })
+
+	h.openThread(item.ID)
+	h.seeBody(msgs[1].ID)
+	r := h.app.mail.reader
+	wantTo("reader", "bob@example.com", func() { r.draft("reply") })
+	wantForward("reader", func() { r.draft("forward") })
+
+	if m, ok := replyTarget(msgs[1:], msgs[0].ID); !ok || m.ID != msgs[1].ID {
+		t.Errorf("a message read alone: replyTarget = %v, %v", m.ID, ok)
+	}
+}

@@ -1,0 +1,400 @@
+package app
+
+import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/godwit-email/godwit/core"
+	"github.com/godwit-email/godwit/core/ai/mask"
+	"github.com/godwit-email/godwit/core/ai/mask/guard"
+	"github.com/godwit-email/godwit/core/coretest"
+	"github.com/godwit-email/godwit/internal/i18n"
+)
+
+// masking opens 隐私与安全 on its 隐私脱敏 tab, tall enough to show it whole.
+func (h *harness) masking() {
+	h.t.Helper()
+	h.resize(1440, 3000)
+	h.openSettings("privacy")
+	h.see(i18n.T("settings.masking.foot"))
+}
+
+// A rule that can't be used is not saved, and the page says which line and
+// why; fixed, it is saved with the words and the allowlist.
+func TestMaskingRulesSaveOnlyWhenValid(t *testing.T) {
+	h, _ := withAccount(t)
+	h.masking()
+	h.typeUnder(i18n.T("settings.masking.rules"), "BAD (x")
+	h.click(i18n.T("settings.masking.save"))
+	h.see("第 1 行的正则无效")
+	h.see("missing closing )")
+	if len(h.app.settings.MaskRules) != 0 {
+		t.Fatalf("an invalid rule was saved: %v", h.app.settings.MaskRules)
+	}
+	h.typeUnder(i18n.T("settings.masking.rules"), ")")
+	h.typeUnder(i18n.T("settings.masking.words"), "Falcon")
+	h.typeUnder(i18n.T("settings.masking.allow"), "GitHub")
+	h.click(i18n.T("settings.masking.save"))
+	h.until("the rules saved", func() bool {
+		st := h.app.settings
+		return len(st.MaskRules) == 1 && st.MaskRules[0] == core.MaskRule{Kind: "BAD", Regex: "(x)"} &&
+			len(st.MaskWords) == 1 && st.MaskWords[0] == "Falcon" && len(st.MaskAllow) == 1 && st.MaskAllow[0] == "GitHub"
+	})
+}
+
+// A rule under a built-in category's name is not saved, and the page says
+// which line.
+func TestMaskingRuleMayNotTakeABuiltInKind(t *testing.T) {
+	h, _ := withAccount(t)
+	h.masking()
+	h.typeUnder(i18n.T("settings.masking.rules"), "ORDER ORD-\\d+\nphone x\\d+")
+	h.click(i18n.T("settings.masking.save"))
+	h.see("第 2 行的类别名和内置类别重名")
+	if len(h.app.settings.MaskRules) != 0 {
+		t.Fatalf("a rule under a built-in kind was saved: %v", h.app.settings.MaskRules)
+	}
+}
+
+// A rule stored under a built-in kind before stays: the rest still saves,
+// and the preview masks with it rather than refusing.
+func TestMaskingKeepsAnOldReservedRule(t *testing.T) {
+	h, _ := withAccount(t)
+	h.masking()
+	p := h.app.pages[PageSettings].(*settingsPage)
+	h.post(func() { h.app.settingsOK.MaskRules = []core.MaskRule{{Kind: "PHONE", Regex: `ext-\d+`}} }) // as a build before stored it
+	h.typeUnder(i18n.T("settings.masking.rules"), "PHONE ext-\\d+")
+	h.typeUnder(i18n.T("settings.masking.allow"), "GitHub")
+	h.click(i18n.T("settings.masking.save"))
+	if h.tt.HasText("第 1 行的类别名和内置类别重名") || p.mask.err != "" {
+		t.Fatalf("the stored rule stops the save: %q", p.mask.err)
+	}
+	if st, _ := p.mask.edited(p.st); p.maskCheck(st, []int{1}) != "" {
+		t.Fatal("the preview refuses the stored rule")
+	}
+}
+
+// The preview shows a pasted text masked, with the words being edited, and
+// saves nothing.
+func TestMaskingPreview(t *testing.T) {
+	h, _ := withAccount(t)
+	h.masking()
+	h.typeUnder(i18n.T("settings.masking.words"), "Falcon")
+	r, _ := h.tt.Find(i18n.T("settings.masking.preview")) // the section's title; its card is the text area
+	h.tt.ClickAt(r.X+r.W/2, r.Y+r.H+40)
+	h.typeText("Falcon card 4111 1111 1111 1111")
+	h.see("{{TERM_")
+	h.see("{{BANK_CARD_")
+	if st := h.app.settings; len(st.MaskWords) != 0 {
+		t.Fatalf("the preview saved words: %v", st.MaskWords)
+	}
+}
+
+// Names are off until turned on; each category's switch saves at once.
+func TestMaskingCategorySwitches(t *testing.T) {
+	h, _ := withAccount(t)
+	h.masking()
+	if h.app.settings.MaskCategories.Names.On {
+		t.Fatal("names are masked by default")
+	}
+	// the switch at the row's right, where the save button below ends
+	label, _ := h.tt.Find(i18n.T("settings.masking.cat.names"))
+	help, _ := h.tt.Find(i18n.T("settings.masking.cat.names.help"))
+	save, _ := h.tt.Find(i18n.T("settings.masking.save"))
+	h.tt.ClickAt(save.X+save.W-16, (label.Y+help.Y+help.H)/2)
+	h.drain()
+	h.tt.Frame()
+	h.until("names on", func() bool { return h.app.settings.MaskCategories.Names.On })
+	h.see(i18n.T("settings.masking.action.mask"))
+}
+
+// 地址 and 账号 have rows of their own, on by default: 账号's switch turns
+// it off, and 地址's action can be set to 仅警告.
+func TestMaskingAddressAndAccountRows(t *testing.T) {
+	h, _ := withAccount(t)
+	h.masking()
+	for _, key := range []string{"settings.masking.cat.addresses", "settings.masking.cat.accounts"} {
+		for _, k := range []string{key, key + ".help"} {
+			if i18n.T(k) == k {
+				t.Fatalf("%s has no copy", k)
+			}
+			h.see(i18n.T(k))
+		}
+	}
+	if st := h.app.settings.MaskCategories; !st.Addresses.On || !st.Accounts.On {
+		t.Fatalf("not on by default: %+v", st)
+	}
+	save, _ := h.tt.Find(i18n.T("settings.masking.save"))
+	row := func(name string) float32 { // a row's middle
+		label, _ := h.tt.Find(i18n.T("settings.masking.cat." + name))
+		help, _ := h.tt.Find(i18n.T("settings.masking.cat." + name + ".help"))
+		return (label.Y + help.Y + help.H) / 2
+	}
+	h.tt.ClickAt(save.X+save.W-16, row("accounts"))
+	h.drain()
+	h.tt.Frame()
+	h.until("accounts off", func() bool { return !h.app.settings.MaskCategories.Accounts.On })
+
+	h.tt.ClickAt(save.X+save.W-120, row("addresses")) // its action, left of the switch
+	h.drain()
+	h.tt.Frame()
+	h.click(i18n.T("settings.masking.action.warn"))
+	h.until("addresses warned", func() bool { return h.app.settings.MaskCategories.Addresses.Action == core.MaskWarn })
+	if st := h.app.settings.MaskCategories; st.Names.Action != core.MaskMask || st.Accounts.Action != core.MaskMask {
+		t.Fatalf("another category changed: %+v", st)
+	}
+}
+
+// recognitionModelHarness is a harness whose Service downloads 识别模型's files
+// from serve.
+func recognitionModelHarness(t *testing.T, serve http.HandlerFunc) *harness {
+	t.Helper()
+	srv := httptest.NewServer(serve)
+	t.Cleanup(srv.Close)
+	h := newHarnessWith(t, []coretest.Option{coretest.WithRecognitionModelSources(srv.URL + "/")}, func(e *coretest.Env) { e.AddAccount(t, "alice@example.com") })
+	h.until("initial load", func() bool { return h.app.loaded })
+	return h
+}
+
+// Turned on before its files are here, 识别模型 downloads them, saying how
+// far it has come; canceled, it is off.
+func TestRecognitionModelDownloadShowsProgressAndCancels(t *testing.T) {
+	h := recognitionModelHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "330781")
+		w.Write(make([]byte, 1000))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+	h.masking()
+	h.see(i18n.T("settings.masking.recognition_model.missing"))
+	h.click(i18n.T("settings.masking.recognition_model"))
+	h.see(i18n.Tf("settings.masking.recognition_model.downloading", 0, formatBytes(330781+37124608+1502881)))
+	if h.app.settings.RecognitionModel {
+		t.Fatal("on before its files are here")
+	}
+	h.click(i18n.T("settings.masking.recognition_model.cancel"))
+	p := h.app.pages[PageSettings].(*settingsPage)
+	h.until("off again", func() bool { return p.recognition.download == nil && !h.app.settings.RecognitionModel })
+	h.see(i18n.T("settings.masking.recognition_model.missing"))
+}
+
+// A download that fails leaves 识别模型 off, and says why.
+func TestRecognitionModelDownloadFailureSaysWhy(t *testing.T) {
+	h := recognitionModelHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write(make([]byte, 330781)) // model_int8.onnx's size, not its contents
+	})
+	h.masking()
+	h.click(i18n.T("settings.masking.recognition_model"))
+	h.see(i18n.Tf("settings.masking.recognition_model.failed", i18n.T("error.recognition_model_mismatch")))
+	if h.app.settings.RecognitionModel {
+		t.Fatal("on with a file that does not match")
+	}
+}
+
+// Once 识别模型's files are here, its switch turns it on at once, and
+// names with it.
+func TestRecognitionModelSwitch(t *testing.T) {
+	h, _ := withAccount(t)
+	installRecognitionModel(t, h.env.DataDir)
+	h.openSettings("general")
+	h.masking()
+	h.see(i18n.T("settings.masking.recognition_model.help"))
+	h.click(i18n.T("settings.masking.recognition_model"))
+	h.until("on, with names", func() bool { st := h.app.settings; return st.RecognitionModel && st.MaskCategories.Names.On })
+}
+
+// installRecognitionModel puts 识别模型's files in dataDir as a download leaves them.
+func installRecognitionModel(t *testing.T, dataDir string) {
+	t.Helper()
+	dir := filepath.Join(dataDir, "cache", "guard", guard.Revision)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range guard.Files {
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// backendModel is a 识别模型 that finds nothing and says what reads it.
+type backendModel struct{ backend core.RecognitionModelBackend }
+
+func (backendModel) Recognize(string) ([]mask.Recognized, error) { return nil, nil }
+
+func (b backendModel) Backend() (core.RecognitionModelBackend, error) { return b.backend, nil }
+
+// Once on, 识别模型's row says what reads it: CoreML and its device, or
+// the CPU, and why not CoreML where it says.
+func TestRecognitionModelSaysWhatReadsIt(t *testing.T) {
+	for backend, want := range map[core.RecognitionModelBackend]string{
+		{Device: "Neural Engine"}:                               "在 CoreML 上运行（Neural Engine）",
+		{NotCoreML: "CoreML failed: the Neural Engine is busy"}: "在 CPU 上运行，没有用 CoreML：CoreML failed: the Neural Engine is busy",
+		{}: "在 CPU 上运行。",
+	} {
+		t.Run(want, func(t *testing.T) {
+			h := newHarnessWith(t, []coretest.Option{coretest.WithRecognizer(backendModel{backend})},
+				func(e *coretest.Env) { e.AddAccount(t, "alice@example.com") })
+			h.until("initial load", func() bool { return h.app.loaded })
+			installRecognitionModel(t, h.env.DataDir)
+			h.masking()
+			h.until("its files seen", func() bool { return h.app.pages[PageSettings].(*settingsPage).recognition.installed })
+			h.click(i18n.T("settings.masking.recognition_model"))
+			h.until("on", func() bool { return h.app.settings.RecognitionModel })
+			h.advance(refreshEvery) // the page refreshes on settings.changed
+			h.see(want)
+		})
+	}
+}
+
+// failingModel is a 识别模型 that fails with err while it is set.
+type failingModel struct{ err atomic.Pointer[error] }
+
+func (f *failingModel) Recognize(string) ([]mask.Recognized, error) {
+	if err := f.err.Load(); err != nil {
+		return nil, *err
+	}
+	return nil, nil
+}
+
+// When 识别模型 fails, its row says why, and that the rules alone mask
+// meanwhile; once it reads again, that is gone.
+func TestRecognitionModelRowSaysWhyItFailed(t *testing.T) {
+	md := &failingModel{}
+	err := errors.New("the model's session was closed")
+	md.err.Store(&err)
+	h := newHarnessWith(t, []coretest.Option{coretest.WithRecognizer(md)}, func(e *coretest.Env) { e.AddAccount(t, "alice@example.com") })
+	h.until("initial load", func() bool { return h.app.loaded })
+	installRecognitionModel(t, h.env.DataDir)
+	h.masking()
+	h.until("its files seen", func() bool { return h.app.pages[PageSettings].(*settingsPage).recognition.installed })
+	h.click(i18n.T("settings.masking.recognition_model"))
+	h.until("on", func() bool { return h.app.settings.RecognitionModel })
+	r, _ := h.tt.Find(i18n.T("settings.masking.preview")) // the preview reads with it
+	h.tt.ClickAt(r.X+r.W/2, r.Y+r.H+40)
+	h.typeText("Sarah Thompson")
+	failed := i18n.Tf("settings.masking.recognition_model.error", humanize(err))
+	h.see(failed)
+
+	md.err.Store(nil)
+	h.typeText(" again")
+	h.until("the reason gone", func() bool { return !h.tt.HasText(failed) })
+	h.see(i18n.T("settings.masking.recognition_model.help"))
+}
+
+// When 识别模型 fails for want of its files, its row says they are coming
+// down again.
+func TestRecognitionModelRowSaysItsFilesAreComingDownAgain(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	t.Cleanup(srv.Close)
+	md := &failingModel{}
+	h := newHarnessWith(t, []coretest.Option{coretest.WithRecognizer(md), coretest.WithRecognitionModelSources(srv.URL + "/")},
+		func(e *coretest.Env) { e.AddAccount(t, "alice@example.com") })
+	h.until("initial load", func() bool { return h.app.loaded })
+	installRecognitionModel(t, h.env.DataDir)
+	h.masking()
+	h.until("its files seen", func() bool { return h.app.pages[PageSettings].(*settingsPage).recognition.installed })
+	h.click(i18n.T("settings.masking.recognition_model"))
+	h.until("on", func() bool { return h.app.settings.RecognitionModel })
+	if err := os.RemoveAll(filepath.Join(h.env.DataDir, "cache", "guard")); err != nil {
+		t.Fatal(err)
+	}
+	err := errors.New("guard: no such file")
+	md.err.Store(&err)
+	r, _ := h.tt.Find(i18n.T("settings.masking.preview"))
+	h.tt.ClickAt(r.X+r.W/2, r.Y+r.H+40)
+	h.typeText("Sarah Thompson")
+	h.see(i18n.T("settings.masking.recognition_model.redownloading"))
+}
+
+// A summary of mail a blocked category (拦截) holds is not asked: the
+// reader says which category held it back.
+func TestABlockedSummarySaysWhy(t *testing.T) {
+	h, acc, llm := aiHarness(t, true, func(st *core.Settings) { noQuick(st); st.MaskCategories.IDs.Action = core.MaskBlock })
+	m := h.deliverOne(acc, coretest.Msg("bob@example.com", acc.Email, "Card", "my card is 4111 1111 1111 1111"))
+	h.openThread(m.ThreadID)
+	h.see("隐私脱敏拦截了这次请求，其中有证件与金融号码")
+	if n := llm.Requests(); n != 0 {
+		t.Fatalf("%d requests sent", n)
+	}
+}
+
+// 脱敏记录, a page of its own, lists the requests; one opens on what it
+// held, by first character and length (a short value by its length only),
+// and the tiles pick the requests by what was done.
+func TestMaskingLogShowsWhatWasSent(t *testing.T) {
+	h, acc, llm := aiHarness(t, true, func(st *core.Settings) { noQuick(st); st.MaskCategories.Emails.Action = core.MaskWarn })
+	llm.Script(coretest.Turn{Text: []string{"ok"}})
+	m := h.deliverOne(acc, coretest.Msg("bob@example.com", acc.Email, "Card", "card 4111 1111 1111 1111"))
+	h.openThread(m.ThreadID)
+	h.until("the summary done", func() bool { s := h.app.mail.reader.ai[m.ID]; return s != nil && s.summary != nil && s.summary.done })
+	h.masking()
+	h.see("最近 30 天：1 次请求，拦截 0 次，1 个值原样发出")
+	h.click("查看脱敏记录")
+	h.until("the log's page", func() bool { return h.app.route.Settings == "masklog" })
+	h.see("有值原样发出")
+	h.click(i18n.T("settings.masking.feature.skill"))
+	h.see("4…，19 个字符")
+	h.see("3 个字符") // bob: short, no first character
+	if h.tt.HasText("4111") || h.tt.HasText("b…，3 个字符") {
+		t.Fatal("the log shows too much of a value")
+	}
+	h.click("被拦截的请求")
+	h.see("没有符合筛选条件的请求")
+}
+
+// A long log shows a page of requests at a time; the tiles count them all.
+func TestMaskingLogPages(t *testing.T) {
+	h, _ := withAccount(t)
+	h.resize(1440, 20000)
+	p := h.openSettings("masklog")
+	now := h.app.clock.Now()
+	n := maskLogPage + 10
+	h.post(func() {
+		p.maskLog = nil
+		for i := range n {
+			p.maskLog = append(p.maskLog, core.MaskRecord{At: now.Add(-time.Duration(i) * time.Minute), Request: int64(n - i), Feature: "wit", Kind: "EMAIL", Category: "emails", Len: 16, Action: core.MaskMask, Source: core.MaskSourceRule})
+		}
+	})
+	last := now.Add(-time.Duration(n-1) * time.Minute).In(now.Location()).Format("15:04")
+	h.see(strconv.Itoa(n))
+	h.see(i18n.T("settings.masking.log.more"))
+	if h.tt.HasText(last) {
+		t.Fatal("the oldest request shows on the first page")
+	}
+	h.click(i18n.T("settings.masking.log.more"))
+	h.see(last)
+	if h.tt.HasText(i18n.T("settings.masking.log.more")) {
+		t.Fatal("显示更多 stays with nothing more to show")
+	}
+}
+
+// A request's values each say what found them: a rule or 识别模型.
+func TestMaskingLogShowsWhatFoundEachValue(t *testing.T) {
+	h, _ := withAccount(t)
+	p := h.openSettings("masklog")
+	now := h.app.clock.Now()
+	h.post(func() {
+		p.maskLog = []core.MaskRecord{
+			{At: now, Request: 1, Feature: "wit", Kind: "NAME", Category: "names", First: "陈", Len: 3, Action: core.MaskMask, Source: core.MaskSourceRecognizer},
+			{At: now, Request: 1, Feature: "wit", Kind: "BANK_CARD", Category: "ids", First: "4", Len: 19, Action: core.MaskMask, Source: core.MaskSourceRule},
+		}
+	})
+	h.click(i18n.T("settings.masking.feature.wit"))
+	h.see("识别模型")
+	h.see("规则")
+}
+
+func TestMaskingCopy(t *testing.T) {
+	h, _ := withAccount(t)
+	h.masking()
+	for _, s := range []string{"隐私脱敏", "godwit mcp", "第三方的人名要靠识别模型", "只支持中文和英文"} {
+		h.see(s)
+	}
+}

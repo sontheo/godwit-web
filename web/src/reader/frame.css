@@ -1,0 +1,90 @@
+* {
+  overscroll-behavior: none;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Wide content scrolls sideways; the page reports its height to native.
+   Long words break only where they overflow: breaking anywhere would let a table column
+   shrink to one letter. */
+#godwit-body {
+  overflow-x: auto;
+  overflow-y: hidden;
+  overflow-wrap: break-word;
+  text-autospace: normal;
+}
+
+#godwit-body.godwit-plain {
+  white-space: pre-wrap;
+}
+
+/* Plain text, and HTML that is text in all but name, keep to the reader's text column
+   (theme.ReaderMaxWidth), as its header does, at the reading line height. */
+#godwit-body.godwit-plain,
+#godwit-body.godwit-text {
+  max-width: 720px;
+  margin: 0 auto;
+  line-height: 1.5;
+}
+
+/* Quoted lines ("> …") step back from the message's own. */
+#godwit-body.godwit-plain .godwit-quote {
+  opacity: 0.6;
+}
+
+/* Keep theme defaults weaker than the email's own text colours. */
+:where(#godwit-body.godwit-light) {
+  color: var(--godwit-fg-light, #0a0a0a);
+}
+
+:where(#godwit-body.godwit-dark) {
+  color: var(--godwit-fg-dark, #fafafa);
+}
+
+/* The parent reveals the light baseline after applying dark colour overrides. */
+#godwit-body.godwit-auto {
+  visibility: hidden;
+}
+
+:where(#godwit-body.godwit-plain) {
+  color: var(--godwit-plain-fg, CanvasText);
+}
+
+:where([data-href]) {
+  cursor: pointer;
+  text-decoration: underline;
+  color: #0b57d0;
+}
+
+[data-href]:focus-visible {
+  outline: 2px solid #0b57d0;
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+:where(#godwit-body.godwit-dark [data-href]) {
+  color: #8ab4f8;
+}
+
+#godwit-body img {
+  /* biome-ignore lint/complexity/noImportantStyles: Fit images even when the email sets an inline width limit. */
+  max-width: 100% !important;
+}
+
+/* Keep the ratio when shrinking, but preserve a height-only icon's size. */
+:where(#godwit-body img:not([height]:not([width]))) {
+  height: auto;
+}
+
+#godwit-body table {
+  max-width: 100%;
+}

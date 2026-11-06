@@ -1,0 +1,164 @@
+package ai
+
+import (
+	"cmp"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+)
+
+// Model is a listed model: its ID and, when the service gives one, a display name.
+type Model struct{ ID, Name string }
+
+// ListModels asks a service for its model IDs, sorted. Errors never include the
+// key or the response body.
+func ListModels(ctx context.Context, c *http.Client, kind, baseURL, apiKey string) ([]string, error) {
+	ms, err := ListModelsNamed(ctx, c, kind, baseURL, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, len(ms))
+	for i, m := range ms {
+		ids[i] = m.ID
+	}
+	return ids, nil
+}
+
+// ListModelsNamed is ListModels with display names. It reads the API's
+// data[].id shape, Sign in with ChatGPT's models[].slug/display_name and
+// xAI's models[].id.
+func ListModelsNamed(ctx context.Context, c *http.Client, kind, baseURL, apiKey string) ([]Model, error) {
+	base := strings.TrimRight(baseURL, "/")
+	url, hdr := modelsURL(ctx, c, base), http.Header{} // before the list's own timeout: a version lookup has its own
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if strings.HasSuffix(base, "/backend-api/codex") && apiKey != "" {
+		hdr.Set("chatgpt-account-id", codexAccountID(apiKey)) // as the Codex CLI: a multi-account plan lists the token's account
+	}
+	switch kind {
+	case KindOpenAI, KindResponses:
+		if apiKey != "" {
+			hdr.Set("Authorization", "Bearer "+apiKey)
+		}
+	case KindAnthropic:
+		url = AnthropicBase(base) + "/v1/models"
+		hdr.Set("anthropic-version", "2023-06-01")
+		if apiKey != "" {
+			hdr.Set("x-api-key", apiKey)
+		}
+	default:
+		return nil, fmt.Errorf("unknown service kind %q", kind)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("list models: bad base URL")
+	}
+	req.Header = hdr
+	if c == nil {
+		c = NoRedirectClient
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		// Never the *url.Error text: it can carry a server-supplied Location.
+		for _, ce := range []error{context.Canceled, context.DeadlineExceeded} {
+			if errors.Is(err, ce) {
+				return nil, fmt.Errorf("list models: %w", ce)
+			}
+		}
+		return nil, errors.New("list models: could not reach the model service")
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return nil, ErrModelAuth
+	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		return nil, &NoListError{resp.StatusCode}
+	default:
+		return nil, fmt.Errorf("list models: HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Data []struct {
+			ID         string
+			Visibility string
+		}
+		Models []struct { // Sign in with ChatGPT and the Codex backend: slug; xAI's language-models: id
+			ID, Slug    string
+			DisplayName string `json:"display_name"`
+			Visibility  string
+		}
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&out); err != nil {
+		return nil, fmt.Errorf("list models: unexpected response")
+	}
+	ms := make([]Model, 0, len(out.Data)+len(out.Models))
+	for _, m := range out.Data {
+		if m.ID != "" && (m.Visibility == "" || m.Visibility == "list") {
+			ms = append(ms, Model{ID: m.ID})
+		}
+	}
+	for _, m := range out.Models {
+		if id := cmp.Or(m.Slug, m.ID); id != "" && (m.Visibility == "" || m.Visibility == "list") {
+			ms = append(ms, Model{id, m.DisplayName})
+		}
+	}
+	sort.Slice(ms, func(i, j int) bool { return ms[i].ID < ms[j].ID })
+	return ms, nil
+}
+
+// modelsURL is where base lists its models. ChatGPT's Codex backend 400s
+// without a client version and lists only what that version may use; xAI's
+// /models mixes in image and video models, which /language-models leaves out.
+func modelsURL(ctx context.Context, c *http.Client, base string) string {
+	switch {
+	case strings.HasSuffix(base, "/backend-api/codex"):
+		return base + "/models?client_version=" + codexClientVersion(ctx, c)
+	case strings.HasSuffix(base, "://api.x.ai/v1"):
+		return base + "/language-models"
+	}
+	return base + "/models"
+}
+
+var (
+	ErrModelAuth   = errors.New("the model service rejected the key")
+	ErrNoModelList = errors.New("the model service has no model list")
+)
+
+// NoRedirectClient never follows redirects, so a key is only ever sent to the
+// configured URL; a 3xx comes back as an HTTP error.
+var NoRedirectClient = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+// NoListError is ErrNoModelList with the status that said so.
+type NoListError struct{ Status int }
+
+func (e *NoListError) Error() string        { return ErrNoModelList.Error() }
+func (e *NoListError) Is(target error) bool { return target == ErrNoModelList }
+
+// codexBase ends the address of ChatGPT's Codex backend (a Codex sign-in's service).
+const codexBase = "/backend-api/codex/"
+
+// codexAccountID is the ChatGPT account a Codex access token (a JWT) is for.
+func codexAccountID(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return ""
+	}
+	var c struct {
+		Auth struct {
+			AccountID string `json:"chatgpt_account_id"`
+		} `json:"https://api.openai.com/auth"`
+	}
+	json.Unmarshal(b, &c)
+	return c.Auth.AccountID
+}

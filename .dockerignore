@@ -1,0 +1,10 @@
+.git
+web/node_modules
+web/dist
+web/dist-web
+site/node_modules
+site/dist
+core/ai/pi/js/node_modules
+dist
+web-data
+.env*

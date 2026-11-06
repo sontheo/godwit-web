@@ -1,0 +1,179 @@
+package app
+
+import (
+	"context"
+	"slices"
+	"strconv"
+
+	"github.com/egoist/mygo/ui"
+	"github.com/godwit-email/godwit/core"
+	"github.com/godwit-email/godwit/internal/i18n"
+	"github.com/godwit-email/godwit/internal/icons"
+	"github.com/godwit-email/godwit/internal/kit"
+	"github.com/godwit-email/godwit/internal/theme"
+)
+
+// listChips is how many chips a list row shows before "+N"; listIconChips,
+// with icon-only chips, which are narrower.
+const (
+	listChips     = 2
+	listIconChips = 4
+)
+
+// label is the label of an id, as the last load read it.
+func (a *App) label(id int64) (core.Label, bool) {
+	for _, l := range a.labels {
+		if l.ID == id {
+			return l, true
+		}
+	}
+	return core.Label{}, false
+}
+
+// labelChip draws an applied label; menu and onRemove may be nil.
+func (a *App) labelChip(c *ui.Context, al core.AppliedLabel, menu func(*ui.Menu), onRemove func()) {
+	l, ok := a.label(al.LabelID)
+	if !ok {
+		return
+	}
+	tip := i18n.T("label.tip.manual")
+	if al.Auto {
+		tip = i18n.T("label.tip.auto")
+	}
+	o := kit.LabelChipOpts{Text: l.Name, Icon: l.Icon, Display: a.settings.LabelDisplay, Tip: tip, Color: theme.Of(c).Label(l.Color), Auto: al.Auto, Menu: menu}
+	if onRemove != nil {
+		o.OnRemove, o.RemoveLabel = onRemove, i18n.Tf("reader.labels.remove", l.Name)
+	}
+	kit.LabelChip(c, o)
+}
+
+// rowChips is a list row's labels: the first listChips (listIconChips for icons), then "+N".
+func (a *App) rowChips(c *ui.Context, ls []core.AppliedLabel) {
+	if len(ls) == 0 {
+		return
+	}
+	t, th := theme.Of(c), c.Theme()
+	maxChips := listChips
+	if a.settings.LabelDisplay == core.LabelDisplayIcon {
+		maxChips = listIconChips
+	}
+	ui.Row(c).Gap(th.Space(1)).AlignItems(ui.Center).Margin(th.Space(1), 0, 0, 0).Children(func() {
+		for _, l := range ls[:min(len(ls), maxChips)] {
+			a.labelChip(c, l, nil, nil)
+		}
+		if n := len(ls) - maxChips; n > 0 {
+			kit.Text(c, i18n.Tf("label.more", n), t.Text.Sm).TextColor(t.Muted)
+		}
+	})
+}
+
+// withLabels fills the items' labels: a thread's from any of its messages.
+func withLabels(ctx context.Context, svc *core.Service, items []mailItem) error {
+	var threads, msgs []int64
+	for _, it := range items {
+		if it.Thread {
+			threads = append(threads, it.ID)
+		} else {
+			msgs = append(msgs, it.ID)
+		}
+	}
+	byThread, err := svc.ThreadLabels(ctx, threads)
+	if err != nil {
+		return err
+	}
+	byMsg, err := svc.MessageLabels(ctx, msgs)
+	if err != nil {
+		return err
+	}
+	for i, it := range items {
+		if it.Thread {
+			items[i].Labels = byThread[it.ID]
+		} else {
+			items[i].Labels = byMsg[it.ID]
+		}
+	}
+	return nil
+}
+
+// appliedLabel is the label of an id among ls.
+func appliedLabel(ls []core.AppliedLabel, id int64) (core.AppliedLabel, bool) {
+	i := slices.IndexFunc(ls, func(l core.AppliedLabel) bool { return l.LabelID == id })
+	if i < 0 {
+		return core.AppliedLabel{}, false
+	}
+	return ls[i], true
+}
+
+// labelItems are the labels as a menu's items, in their colors: state says
+// whether each is on, and whether a model put it on; toggle switches it.
+func labelItems(m *ui.Menu, t theme.Tokens, labels []core.Label, state func(id int64) (on, auto bool), toggle func(id int64, on bool)) {
+	for _, l := range labels {
+		on, auto := state(l.ID)
+		name := l.Name
+		if on && auto {
+			name += " · " + i18n.T("reader.labels.auto")
+		}
+		if m.Item(name).Icon(labelMenuIcon(t, l)).Checked(on).Chosen() {
+			toggle(l.ID, !on)
+		}
+	}
+}
+
+// labelSubmenu is labelItems as a menu's submenu; none without labels.
+func labelSubmenu(m *ui.Menu, t theme.Tokens, labels []core.Label, state func(id int64) (on, auto bool), toggle func(id int64, on bool)) {
+	if len(labels) == 0 {
+		return
+	}
+	m.Submenu(i18n.T("mail.menu.labels"), func(sm *ui.Menu) { labelItems(sm, t, labels, state, toggle) }).Icon(menuIcon("tag"))
+}
+
+// labelNav is the sidebar's foldable label group: the labels on some mail.
+func (p *mailPage) labelNav(c *ui.Context) {
+	a := p.a
+	t, th := theme.Of(c), c.Theme()
+	if !slices.ContainsFunc(a.labels, func(l core.Label) bool { return l.Count > 0 }) {
+		return
+	}
+	kit.SidebarCollapsible(c, &p.labelsOpen, true, func() {
+		ui.Text(c, i18n.T("mail.labels")).SingleLine().Grow(1).Shrink(1)
+	}, func() {
+		for _, l := range a.labels {
+			if l.Count == 0 {
+				continue
+			}
+			v := core.View{LabelID: l.ID}
+			on := p.viewShown(v)
+			item := kit.SidebarItem(c, kit.SidebarItemOpts{Selected: on, OnClick: func() { a.navigate(Route{Page: PageMail, View: v}) }})
+			item.Children(func() {
+				ui.Icon(c, icons.Get("label-"+l.Icon)).Size(theme.Icon, theme.Icon).TextColor(t.Label(l.Color).Text)
+				ui.Text(c, l.Name).SingleLine().Grow(1).Shrink(1)
+				if l.Unread > 0 {
+					kit.Text(c, strconv.Itoa(l.Unread), t.Text.Sm).TextColor(t.Muted)
+				}
+			})
+			item.ContextMenu(func(m *ui.Menu) {
+				if m.Item(i18n.T("mail.mark_all_read")).Disabled(l.Unread == 0).Chosen() {
+					p.markViewAsRead(core.View{LabelID: l.ID})
+				}
+			})
+		}
+	})
+	ui.Box(c).Height(th.Space(2))
+}
+
+// goneLabel reports a route to the view of a label that no longer exists.
+func (a *App) goneLabel(r Route) bool {
+	if r.Page != PageMail || r.View.LabelID == 0 || !a.loaded {
+		return false
+	}
+	_, ok := a.label(r.View.LabelID)
+	return !ok
+}
+
+// AccountLabels returns the labels for an account, with count and unread for that account.
+func (a *App) AccountLabels(accID int64) []core.Label {
+	if a.accountLabels != nil {
+		return a.accountLabels[accID]
+	}
+	return nil
+}

@@ -1,0 +1,79 @@
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    # MyGo moves with mygo-runtime in web/, the go directive and mise.toml in
+    # one PR; the weekly Claude dependency review opens that PR instead.
+    ignore:
+      - dependency-name: github.com/egoist/mygo
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      # Alpha engine under every script plugin and the pi runtime; own PR.
+      moejs:
+        patterns: [github.com/Calcium-Ion/moejs]
+      go:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: bun
+    directory: /web
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    # See github.com/egoist/mygo above.
+    ignore:
+      - dependency-name: mygo-runtime
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      web:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # Bumps here leave core/ai/pi/engine.js stale; run `mise run ai:bundle` on
+  # the PR and push before merging.
+  - package-ecosystem: bun
+    directory: /core/ai/pi/js
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 3
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      pi:
+        patterns: ["*"]
+
+  - package-ecosystem: bun
+    directory: /site
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 3
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      site:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]

@@ -1,0 +1,47 @@
+name: Bug report
+description: Something is broken or behaves wrongly
+labels: [bug, needs-triage]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Godwit version
+      description: Find it in Settings › About
+      placeholder: "1.26.2"
+    validations:
+      required: true
+  # A text input, not a dropdown: the app's 报告问题 link prefills it by this id.
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15, Windows 11, Debian 13
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Mail provider or IMAP server
+      description: Fill this in if the problem involves mail
+      placeholder: Gmail, QQ, imap.example.com
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error message or logs
+      description: Remove email addresses, passwords and other private details first
+      render: text

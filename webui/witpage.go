@@ -1,0 +1,802 @@
+package webui
+
+import (
+	"cmp"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/url"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/egoist/mygo"
+	"github.com/godwit-email/godwit/core"
+	"github.com/godwit-email/godwit/internal/i18n"
+)
+
+// ErrNotAsk is returned to the Wit page for a conversation that is not an
+// ask one, or an approval or run not of the ask conversation it follows.
+var ErrNotAsk = errors.New("the Wit page acts on its ask conversation only")
+
+// errSuperseded ends a selection that a newer one replaced; a cancellation,
+// so the page shows nothing for it.
+var errSuperseded = fmt.Errorf("a newer conversation was opened: %w", context.Canceled)
+
+// WitPageState is what the Wit page shows besides the conversation.
+type WitPageState struct {
+	// Conversation is the route's (0: a new one) as of Version, the
+	// snapshot's: the page applies only newer ones (WitOpen).
+	Conversation int64 `json:"conversation"`
+	Version      int64 `json:"version"`
+	// Model is the default model's label; "" for none.
+	Model  string `json:"model"`
+	Locale string `json:"locale"`
+	Theme  Theme  `json:"theme"`
+}
+
+// WitOpenMsg tells the Wit page to show Conversation (0: a new one), the
+// snapshot at Version. Created marks native taking the conversation the
+// page's Ask made (SetCreated): the page's first question goes on in it,
+// no switch.
+type WitOpenMsg struct {
+	Conversation int64 `json:"conversation"`
+	Version      int64 `json:"version"`
+	Created      bool  `json:"created"`
+}
+
+var (
+	// WitOpen tells the Wit page the route's conversation changed.
+	WitOpen = mygo.NewEvent[WitOpenMsg]("witOpen")
+	// WitState tells the Wit page its model label, copy or theme changed
+	// (the settings did); the conversation and its stream stay.
+	WitState = mygo.NewEvent[WitPageState]("witState")
+	// WitAsk tells the Wit page native handed it a question (the palette's):
+	// the page takes it (TakeAsk) and asks it once, in the conversation it
+	// shows.
+	WitAsk = mygo.NewEvent[string]("witAsk")
+)
+
+// WitPageDeps is what WitPage needs from the platform. The native callbacks
+// post to the UI thread.
+type WitPageDeps struct {
+	// Emit sends a Wit event to the page (WitStream.EmitPage in production).
+	Emit func(t Target, ev WitEvent)
+	// Open and State send WitOpen and WitState to the page.
+	Open  func(WitOpenMsg)
+	State func(WitPageState)
+	// Ask sends WitAsk to the page.
+	Ask func(query string)
+	// OpenMessage opens message id in the reader; OpenModels the model
+	// settings; Navigate goes back (-1) or forward (1); Search opens the
+	// search palette.
+	OpenMessage func(id int64)
+	OpenModels  func()
+	Navigate    func(dir int)
+	Search      func()
+	// NewConversation shows a new conversation, as the sidebar's 新对话 does.
+	NewConversation func()
+	// ConversationCreated is told Ask made conversation id, asked under
+	// snapshot version.
+	ConversationCreated func(id, version int64)
+	// OnLink opens a link of an answer as mail's own: http(s) after the
+	// native confirmation, mailto as a draft. OpenCompose opens draft id in
+	// a compose window.
+	OnLink      func(url string)
+	OpenCompose func(draftID int64)
+	// EditRule opens the rules editor on a rule Wit proposed in conversation
+	// conv as approval, for the question ask (在编辑器里修改).
+	EditRule func(r core.Rule, conv, approval int64, ask string)
+}
+
+// Wit keeps the Wit page's state: the route's conversation as a versioned
+// snapshot and the page's subscription. It is not bound: the page reaches
+// it only through WitPage; native calls SetConversation and SettingsChanged.
+type Wit struct {
+	pages *Pages
+	d     WitPageDeps
+
+	decideMu sync.Mutex // decisions run one at a time, as they come
+	// askMu holds an Ask from setting its conversation's model until its run
+	// is claimed: another Ask's model cannot come in between.
+	askMu sync.Mutex
+
+	mu      sync.Mutex
+	svc     *core.Service
+	conv    int64          // the snapshot: the route's conversation
+	own     map[int64]bool // the runs the page's Ask started: Stop takes them wherever it is
+	version int64          // bumped per SetConversation
+	sel     uint64         // bumped per selection (Follow, Ask): only the newest subscribes
+	f       *follow        // the page's subscription; nil for none
+	ask     WitHandoff     // a question handed over, until the page takes it (TakeAsk)
+}
+
+// NewWit is the Wit page's state for the pages of role "wit"; SetService
+// opens it up.
+func NewWit(pages *Pages, d WitPageDeps) *Wit { return &Wit{pages: pages, d: d} }
+
+// SetService gives the page the service, once the data is open.
+func (w *Wit) SetService(svc *core.Service) {
+	w.mu.Lock()
+	w.svc = svc
+	w.mu.Unlock()
+}
+
+// WitPage is what the Wit page (role "wit", embedded in the main window)
+// calls (mygo.Bind). It acts on ask conversations only.
+type WitPage struct{ w *Wit }
+
+// NewWitPage is the bound facade of w.
+func NewWitPage(w *Wit) *WitPage { return &WitPage{w: w} }
+
+// caller is the calling page, if it is the Wit page, and the service.
+func (w *Wit) caller(ctx context.Context) (Target, *core.Service, error) {
+	id, err := w.pages.Caller(ctx, "wit")
+	if err != nil {
+		return Target{}, nil, err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.svc == nil {
+		return Target{}, nil, ErrNotReady
+	}
+	return Target{Page: id}, w.svc, nil
+}
+
+// SetConversation is the route's conversation (0: a new one), as native
+// navigates: a new snapshot version, sent to the page (WitOpen) and returned.
+func (w *Wit) SetConversation(id int64) int64 { return w.open(id, false) }
+
+// SetCreated is SetConversation for native taking the conversation the
+// page's Ask made (ConversationCreated): WitOpen says Created, so the
+// page's first question goes on in it.
+func (w *Wit) SetCreated(id int64) int64 { return w.open(id, true) }
+
+func (w *Wit) open(id int64, created bool) int64 {
+	w.mu.Lock()
+	w.version++
+	m := WitOpenMsg{Conversation: id, Version: w.version, Created: created}
+	w.conv = id
+	w.mu.Unlock()
+	w.d.Open(m)
+	return m.Version
+}
+
+// WitHandoff is a question native handed over: its text and the mail it
+// quotes (the reader's 让 Wit 帮你回复 quotes the mail read).
+type WitHandoff struct {
+	Text string    `json:"text"`
+	Hits []MailHit `json:"hits"`
+}
+
+// Handoff gives the page a question to ask (WitAsk), quoting the mail
+// quoted: the page starts the run through WitPage.Ask, so it follows it and
+// Stop works. Native navigates to a new conversation first.
+// The question waits until the page takes it: a page still loading misses
+// the event and takes it once it has loaded.
+func (w *Wit) Handoff(query string, quoted ...core.MessageSummary) {
+	if strings.TrimSpace(query) == "" {
+		return
+	}
+	h := WitHandoff{Text: query, Hits: []MailHit{}}
+	for _, m := range quoted {
+		hit := MailHit{ID: m.ID, Subject: m.Subject, From: m.From}
+		if !m.Date.IsZero() {
+			hit.Date = m.Date.UnixMilli()
+		}
+		h.Hits = append(h.Hits, hit)
+	}
+	w.mu.Lock()
+	w.ask = h
+	w.mu.Unlock()
+	w.d.Ask(query)
+}
+
+// TakeAsk is the question native handed over and the page has not taken
+// yet, an empty Text for none; taking it leaves none, so the page asks it once.
+func (p *WitPage) TakeAsk(ctx context.Context) (WitHandoff, error) {
+	if _, _, err := p.w.caller(ctx); err != nil {
+		return WitHandoff{Hits: []MailHit{}}, err
+	}
+	p.w.mu.Lock()
+	defer p.w.mu.Unlock()
+	h := p.w.ask
+	p.w.ask = WitHandoff{}
+	if h.Hits == nil {
+		h.Hits = []MailHit{}
+	}
+	return h, nil
+}
+
+// SettingsChanged sends the page its state for st (WitState).
+func (w *Wit) SettingsChanged(st core.Settings) { w.d.State(w.state(st)) }
+
+func (w *Wit) state(st core.Settings) WitPageState {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return WitPageState{Conversation: w.conv, Version: w.version, Model: modelLabel(context.Background(), w.svc, st.DefaultModel), Locale: i18n.Language(), Theme: ThemeOf(st)}
+}
+
+// modelLabel is a default model's label: its display name (svc nil: none),
+// else its ID without the provider.
+func modelLabel(ctx context.Context, svc *core.Service, model string) string {
+	if strings.HasPrefix(model, "plugin/"+core.AppleIntelligencePlugin+"/") {
+		return "Apple Intelligence"
+	}
+	if svc != nil {
+		if n := svc.ModelName(ctx, model); n != "" {
+			return n
+		}
+	}
+	if _, m, ok := strings.Cut(model, "/"); ok {
+		return m
+	}
+	return model
+}
+
+// Load is the page's state: the snapshot, the model, the copy and the theme.
+func (p *WitPage) Load(ctx context.Context) (WitPageState, error) {
+	_, svc, err := p.w.caller(ctx)
+	if err != nil {
+		return WitPageState{}, err
+	}
+	st, err := svc.GetSettings(ctx)
+	if err != nil {
+		return WitPageState{}, err
+	}
+	return p.w.state(st), nil
+}
+
+// selection starts a selection: an older one no longer subscribes.
+func (w *Wit) selection() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sel++
+	return w.sel
+}
+
+// followConv makes the page follow conv for selection sel: its
+// subscription if it follows conv, else a new one in place of it. A newer
+// selection since gets errSuperseded.
+func (w *Wit) followConv(t Target, svc *core.Service, conv int64, sel uint64) (*follow, error) {
+	w.mu.Lock()
+	if sel != w.sel {
+		w.mu.Unlock()
+		return nil, errSuperseded
+	}
+	old := w.f
+	if old != nil && old.conv == conv {
+		w.mu.Unlock()
+		return old, nil
+	}
+	var f *follow
+	var ch <-chan core.WitEvent
+	if conv != 0 {
+		var stop func()
+		ch, stop = svc.SubscribeConversation(conv)
+		f = &follow{conv: conv, stop: stop}
+	}
+	w.f = f
+	w.mu.Unlock()
+	if old != nil {
+		old.end()
+	}
+	if f != nil {
+		go f.pump(t, ch, w.d.Emit)
+	}
+	return f, nil
+}
+
+// followWith makes the page follow conv on ch, a subscription stop ends
+// (core FollowConversation), for selection sel, in place of what it
+// followed. A newer selection since gets errSuperseded.
+func (w *Wit) followWith(t Target, conv int64, ch <-chan core.WitEvent, stop func(), sel uint64) error {
+	w.mu.Lock()
+	if sel != w.sel {
+		w.mu.Unlock()
+		stop()
+		return errSuperseded
+	}
+	old := w.f
+	f := &follow{conv: conv, stop: stop}
+	w.f = f
+	w.mu.Unlock()
+	if old != nil {
+		old.end()
+	}
+	go f.pump(t, ch, w.d.Emit)
+	return nil
+}
+
+// followed is the conversation the page follows; 0 for none.
+func (w *Wit) followed() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f == nil {
+		return 0
+	}
+	return w.f.conv
+}
+
+// askConv checks conv is an ask conversation.
+func askConv(ctx context.Context, svc *core.Service, conv int64) error {
+	c, err := svc.GetConversation(ctx, conv)
+	if err == nil && c.Kind != "ask" {
+		err = ErrNotAsk
+	}
+	return err
+}
+
+// Follow makes the page follow conv, an ask conversation (0: none), and
+// returns its history (core FollowConversation): the events after it go to
+// the page, none of them in it already. The newest selection wins: an older
+// Follow or Ask no longer subscribes.
+func (p *WitPage) Follow(ctx context.Context, conv int64) (WitHistory, error) {
+	t, svc, err := p.w.caller(ctx)
+	if err != nil {
+		return WitHistory{}, keyed(err)
+	}
+	sel := p.w.selection()
+	if conv == 0 {
+		_, err := p.w.followConv(t, svc, 0, sel)
+		return noHistory(), keyed(err)
+	}
+	if err := askConv(ctx, svc, conv); err != nil {
+		return WitHistory{}, keyed(err)
+	}
+	c, ch, stop, err := svc.FollowConversation(ctx, conv)
+	if err != nil {
+		return WitHistory{}, keyed(err)
+	}
+	if err := p.w.followWith(t, conv, ch, stop, sel); err != nil {
+		return noHistory(), keyed(err)
+	}
+	if followHook != nil {
+		followHook()
+	}
+	return history(c), nil
+}
+
+// Ask asks input in conv, an ask conversation, with the mail the user quoted
+// (message IDs; core AskWith), on model (a ModelChoice's Ref; "": the
+// default) with reasoning effort ("low", "medium", "high"; "": none), which
+// the conversation keeps; conv 0 makes one first, which
+// ConversationCreated hears of. rewind, unless "", asks it in place of the
+// question of that turn (WitTurn.ID) and what followed (core AskAgain): a
+// refused question leaves the conversation as it was. The page follows conv
+// from before the run starts, unless a newer selection came meanwhile. Only
+// Stop cancels the run: a page reload does not. zone is the page's IANA time
+// zone (core WithTimeZone).
+func (p *WitPage) Ask(ctx context.Context, conv int64, input string, quoted []int64, model, effort string, rewind string, zone string) (RunStart, error) {
+	ctx = core.WithTimeZone(ctx, zone)
+	t, svc, err := p.w.caller(ctx)
+	if err != nil {
+		return RunStart{}, keyed(err)
+	}
+	if strings.TrimSpace(input) == "" {
+		return RunStart{}, keyed(errors.New("the question is empty"))
+	}
+	sel := p.w.selection()
+	p.w.mu.Lock()
+	version := p.w.version
+	p.w.mu.Unlock()
+	made := conv == 0
+	if made {
+		c, err := svc.NewConversation(ctx, "ask", 0)
+		if err != nil {
+			return RunStart{}, keyed(err)
+		}
+		conv = c.ID
+	} else if err := askConv(ctx, svc, conv); err != nil {
+		return RunStart{}, keyed(err)
+	}
+	p.w.askMu.Lock()
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			unlocked = true
+			p.w.askMu.Unlock()
+		}
+	}
+	defer unlock()
+	// refused keeps the question in conv with why (core FailQuestion), a new
+	// conv too, which the page is switched to: nothing typed is lost.
+	refused := func(err error) (RunStart, error) {
+		if key := errorKey(err); key != "" && rewind == "" && !errors.Is(err, core.ErrRunActive) {
+			if ferr := svc.FailQuestion(context.WithoutCancel(ctx), conv, input, quoted, key); ferr != nil {
+				log.Printf("wit: keeping a refused question: %v", ferr)
+			}
+		}
+		if made {
+			p.w.created(conv, version)
+			return RunStart{}, keyed(err)
+		}
+		return RunStart{Conversation: conv}, keyed(err) // ErrRunActive: the active run goes on being followed
+	}
+	if err := svc.SetConversationModel(ctx, conv, model, effort); err != nil {
+		unlock()
+		return refused(err)
+	}
+	if startHook != nil {
+		startHook()
+	}
+	if _, err := p.w.followConv(t, svc, conv, sel); err != nil && !errors.Is(err, errSuperseded) {
+		return RunStart{}, keyed(err)
+	}
+	var ch <-chan core.WitEvent
+	if rewind != "" && !made {
+		ch, err = svc.AskAgain(context.WithoutCancel(ctx), conv, rewind, input, quoted)
+	} else {
+		ch, err = svc.AskWith(context.WithoutCancel(ctx), conv, input, quoted)
+	}
+	unlock() // claimed, or refused
+	if err != nil {
+		return refused(err)
+	}
+	if made { // titled by now
+		p.w.created(conv, version)
+	}
+	ev, _ := started(ch)
+	id := ev.RunID
+	go func() { // the subscription shows the same events
+		for range ch {
+		}
+	}()
+	p.w.mu.Lock()
+	if p.w.own == nil {
+		p.w.own = map[int64]bool{}
+	}
+	p.w.own[id] = true // ponytail: kept for the session; a few IDs per question
+	p.w.mu.Unlock()
+	return RunStart{Run: id, Conversation: conv, Turn: ev.Turn}, nil
+}
+
+// created notes that Ask made conv under snapshot version: the snapshot
+// takes it while it is still that version's new conversation.
+func (w *Wit) created(conv, version int64) {
+	w.mu.Lock()
+	if w.version == version && w.conv == 0 {
+		w.conv = conv
+	}
+	w.mu.Unlock()
+	w.d.ConversationCreated(conv, version)
+}
+
+// Compact summarizes ask conversation conv's turns before its last two now
+// (core CompactConversation); the page reads its usage again after.
+func (p *WitPage) Compact(ctx context.Context, conv int64) error {
+	_, svc, err := p.w.caller(ctx)
+	if err != nil {
+		return keyed(err)
+	}
+	if err := askConv(ctx, svc, conv); err != nil {
+		return keyed(err)
+	}
+	return keyed(svc.CompactConversation(ctx, conv))
+}
+
+// Stop cancels run: one the page's Ask started (a Stop pressed before Ask
+// returned may come after a switch), or one of the conversation it follows.
+func (p *WitPage) Stop(ctx context.Context, run int64) error {
+	_, svc, err := p.w.caller(ctx)
+	if err != nil {
+		return keyed(err)
+	}
+	p.w.mu.Lock()
+	own := p.w.own[run]
+	p.w.mu.Unlock()
+	if own {
+		return keyed(svc.CancelRun(context.WithoutCancel(ctx), run))
+	}
+	conv := p.w.followed()
+	if conv == 0 {
+		return keyed(ErrNotAsk)
+	}
+	if c, err := svc.RunConversation(ctx, run); err != nil || c != conv {
+		return keyed(cmp.Or(err, ErrNotAsk))
+	}
+	return keyed(svc.CancelRun(context.WithoutCancel(ctx), run))
+}
+
+// Decide accepts or rejects approval, one of the conversation the page
+// follows: the run it resumes streams on that subscription.
+func (p *WitPage) Decide(ctx context.Context, approval int64, accept bool) error {
+	return p.decide(ctx, func(a core.Approval) bool { return a.ID == approval }, func(svc *core.Service) error {
+		return svc.ResolveApproval(context.WithoutCancel(ctx), approval, accept)
+	})
+}
+
+// DecideWithArgs accepts or rejects approval with edited arguments args.
+func (p *WitPage) DecideWithArgs(ctx context.Context, approval int64, accept bool, args string) error {
+	return p.decide(ctx, func(a core.Approval) bool { return a.ID == approval }, func(svc *core.Service) error {
+		var raw json.RawMessage
+		if strings.TrimSpace(args) != "" {
+			raw = json.RawMessage(args)
+		}
+		return svc.ResolveApprovalWithArgs(context.WithoutCancel(ctx), approval, accept, raw)
+	})
+}
+
+// DecideAll accepts or rejects every pending approval of run, one of the
+// conversation the page follows (全部允许). As Decide.
+func (p *WitPage) DecideAll(ctx context.Context, run int64, accept bool) error {
+	return p.decide(ctx, func(a core.Approval) bool { return a.RunID == run }, func(svc *core.Service) error {
+		return svc.ResolveAll(context.WithoutCancel(ctx), run, accept)
+	})
+}
+
+// DecideSession accepts approval and allows its tool for the rest of the
+// conversation (本次对话都允许; core ResolveApprovalForConversation). As Decide.
+func (p *WitPage) DecideSession(ctx context.Context, approval int64) error {
+	return p.decide(ctx, func(a core.Approval) bool { return a.ID == approval }, func(svc *core.Service) error {
+		return svc.ResolveApprovalForConversation(context.WithoutCancel(ctx), approval)
+	})
+}
+
+// EditRule takes rule proposal approval, one of the conversation the page
+// follows, to the rules editor unsaved (在编辑器里修改; core
+// EditProposedRule): its card stays pending until the user saves it, there
+// or from the card. As Decide.
+func (p *WitPage) EditRule(ctx context.Context, approval int64) error {
+	return p.decide(ctx, func(a core.Approval) bool { return a.ID == approval }, func(svc *core.Service) error {
+		r, err := svc.EditProposedRule(context.WithoutCancel(ctx), approval)
+		if err == nil {
+			conv := p.w.followed()
+			p.w.d.EditRule(r, conv, approval, proposalAsk(ctx, svc, conv, approval))
+		}
+		return err
+	})
+}
+
+// proposalAsk is the question of conv whose turn holds approval, for the
+// editor's banner; "" when it cannot be read.
+func proposalAsk(ctx context.Context, svc *core.Service, conv, approval int64) string {
+	c, err := svc.GetConversation(ctx, conv)
+	if err != nil {
+		return ""
+	}
+	for _, t := range c.Turns {
+		if slices.ContainsFunc(t.Calls, func(tc core.TurnCall) bool { return tc.Approval != nil && tc.Approval.ID == approval }) {
+			return t.Question
+		}
+	}
+	return ""
+}
+
+// Answer answers question approval, one of the conversation the page follows,
+// with one list of answers per question, for the round of its form the user
+// saw (core AnswerQuestion). As Decide.
+func (p *WitPage) Answer(ctx context.Context, approval int64, round int, answers [][]string) error {
+	return p.decide(ctx, func(a core.Approval) bool { return a.ID == approval }, func(svc *core.Service) error {
+		return svc.AnswerQuestion(context.WithoutCancel(ctx), approval, round, answers)
+	})
+}
+
+// SearchMail is the quote picker's search (core Search, every account).
+func (p *WitPage) SearchMail(ctx context.Context, query string) ([]MailHit, error) {
+	_, svc, err := p.w.caller(ctx)
+	if err != nil {
+		return nil, keyed(err)
+	}
+	return searchMail(ctx, svc, query)
+}
+
+// decide runs act once an approval of the followed conversation is, one
+// decision at a time.
+func (p *WitPage) decide(ctx context.Context, is func(core.Approval) bool, act func(*core.Service) error) error {
+	_, svc, err := p.w.caller(ctx)
+	if err != nil {
+		return keyed(err)
+	}
+	p.w.decideMu.Lock()
+	defer p.w.decideMu.Unlock()
+	conv := p.w.followed()
+	if conv == 0 {
+		return keyed(ErrNotAsk)
+	}
+	as, err := svc.ListApprovals(ctx, conv)
+	if err != nil {
+		return keyed(err)
+	}
+	if !slices.ContainsFunc(as, is) {
+		return keyed(ErrNotAsk)
+	}
+	return keyed(act(svc))
+}
+
+// OpenCited opens cited message id in the reader.
+func (p *WitPage) OpenCited(ctx context.Context, message int64) error {
+	if err := p.CheckCited(ctx, message); err != nil {
+		return err
+	}
+	p.w.d.OpenMessage(message)
+	return nil
+}
+
+// CheckCited is ErrMailGone for a cited message deleted since it was cited
+// (a sync removed it): the page checks before it quotes one, and drops its
+// actions.
+func (p *WitPage) CheckCited(ctx context.Context, message int64) error {
+	_, svc, err := p.w.caller(ctx)
+	if err != nil {
+		return keyed(err)
+	}
+	return checkCited(ctx, svc, message)
+}
+
+// checkCited is ErrMailGone for message deleted since it was cited.
+func checkCited(ctx context.Context, svc *core.Service, message int64) error {
+	// a row lookup: loading the message could fetch its inline images over IMAP
+	ok, err := svc.MessageExists(ctx, message)
+	if err != nil {
+		return keyed(err)
+	}
+	if !ok {
+		return keyed(ErrMailGone)
+	}
+	return nil
+}
+
+// ErrMailGone: a cited message was deleted since (wit.mail.gone).
+var ErrMailGone = errors.New("the cited mail is gone")
+
+// OpenDraft opens the draft an allowed create_draft (approval) made, in a
+// compose window.
+func (p *WitPage) OpenDraft(ctx context.Context, approval int64) error {
+	_, svc, err := p.w.caller(ctx)
+	if err != nil {
+		return keyed(err)
+	}
+	id, err := svc.DraftForApproval(ctx, approval)
+	if err != nil {
+		return keyed(err)
+	}
+	p.w.d.OpenCompose(id)
+	return nil
+}
+
+// OpenLink hands an http, https or mailto link of Wit's answer to native,
+// which treats it as a link in mail (OnLink); any other is ErrBadLink.
+func (p *WitPage) OpenLink(ctx context.Context, link string) error {
+	if _, _, err := p.w.caller(ctx); err != nil {
+		return keyed(err)
+	}
+	u, err := url.Parse(link)
+	if err != nil {
+		return ErrBadLink
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "mailto":
+		p.w.d.OnLink(link)
+		return nil
+	}
+	return ErrBadLink
+}
+
+// ModelChoice is a model Wit can answer with: Ref is what Ask takes; Service
+// the model service (or plugin) it comes from, which the menu groups by, and
+// Name the model as the settings show it.
+type ModelChoice struct {
+	Ref     string `json:"ref"`
+	Service string `json:"service"`
+	Name    string `json:"name"`
+	// Default: it is the settings' default model, which a conversation
+	// with no model of its own answers with.
+	Default bool `json:"default"`
+}
+
+// Models are the models a conversation can use (modelChoices).
+func (p *WitPage) Models(ctx context.Context) ([]ModelChoice, error) {
+	_, svc, err := p.w.caller(ctx)
+	if err != nil {
+		return nil, keyed(err)
+	}
+	return modelChoices(ctx, svc)
+}
+
+// modelChoices are the models a conversation can use: every generating
+// service's, then the running plugins' (judges aside), as the settings'
+// default model offers; the default one says so.
+func modelChoices(ctx context.Context, svc *core.Service) ([]ModelChoice, error) {
+	services, err := svc.ListModelServices(ctx)
+	if err != nil {
+		return nil, keyed(err)
+	}
+	plugins, err := svc.ListPluginModels(ctx)
+	if err != nil {
+		return nil, keyed(err)
+	}
+	st, err := svc.GetSettings(ctx)
+	if err != nil {
+		return nil, keyed(err)
+	}
+	out := []ModelChoice{}
+	for _, s := range services {
+		if s.Kind == "" {
+			continue
+		}
+		for _, m := range s.Models {
+			out = append(out, ModelChoice{Ref: s.Slug + "/" + m, Service: s.Name, Name: cmp.Or(s.Names[m], m)})
+		}
+	}
+	for _, pm := range plugins {
+		for _, m := range pm.Models {
+			if !m.Judges() && m.Operation != "small" {
+				out = append(out, ModelChoice{Ref: "plugin/" + pm.Plugin + "/" + m.ID, Service: pm.Plugin, Name: m.Name})
+			}
+		}
+	}
+	for i := range out {
+		out[i].Default = out[i].Ref == st.DefaultModel
+	}
+	return out, nil
+}
+
+// OpenModels opens the model settings.
+func (p *WitPage) OpenModels(ctx context.Context) error {
+	if _, _, err := p.w.caller(ctx); err != nil {
+		return keyed(err)
+	}
+	p.w.d.OpenModels()
+	return nil
+}
+
+// ErrBadDirection is returned for a Navigate that is not -1 or 1.
+var ErrBadDirection = errors.New("navigate goes back (-1) or forward (1)")
+
+// Navigate goes back (-1) or forward (1), as ⌘[ and ⌘] do natively.
+// NewConversation shows a new conversation (the input's /new).
+func (p *WitPage) NewConversation(ctx context.Context) error {
+	if _, _, err := p.w.caller(ctx); err != nil {
+		return keyed(err)
+	}
+	if p.w.d.NewConversation != nil {
+		p.w.d.NewConversation()
+	}
+	return nil
+}
+
+// WitSkill is a skill the input's / menu offers: the model's own (no UI binding), enabled.
+type WitSkill struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// Skills lists the skills a question can name with /, as the model's list_skills does.
+func (p *WitPage) Skills(ctx context.Context) ([]WitSkill, error) {
+	_, svc, err := p.w.caller(ctx)
+	if err != nil {
+		return nil, keyed(err)
+	}
+	all, err := svc.ListSkills(ctx)
+	out := []WitSkill{}
+	for _, sk := range all {
+		if sk.Enabled && !sk.UI && sk.Error == "" {
+			out = append(out, WitSkill{Name: sk.Name, Description: sk.Description})
+		}
+	}
+	return out, keyed(err)
+}
+
+func (p *WitPage) Navigate(ctx context.Context, dir int) error {
+	if _, _, err := p.w.caller(ctx); err != nil {
+		return keyed(err)
+	}
+	if dir != -1 && dir != 1 {
+		return keyed(ErrBadDirection)
+	}
+	p.w.d.Navigate(dir)
+	return nil
+}
+
+// Search opens the search palette, as ⌘K and ⌘F do natively: a page that
+// has the keyboard misses the native shortcut.
+func (p *WitPage) Search(ctx context.Context) error {
+	if _, _, err := p.w.caller(ctx); err != nil {
+		return keyed(err)
+	}
+	p.w.d.Search()
+	return nil
+}
