@@ -3,19 +3,19 @@ module github.com/godwit-email/godwit
 go 1.27.3
 
 require (
-	github.com/MoeForge/moejs v0.1.0-alpha.11
-	github.com/clipperhouse/uax29/v2 v2.2.0
-	github.com/ebitengine/purego v0.11.2
+	github.com/MoeForge/moejs v0.1.1
+	github.com/clipperhouse/uax29/v2 v2.7.0
+	github.com/ebitengine/purego v0.11.3
 	github.com/egoist/mygo v0.7.5-0.20261105134437-3a92ba0d2c90
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
 	github.com/emersion/go-message v0.18.2
 	github.com/emersion/go-msgauth v0.7.0
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
-	github.com/emersion/go-smtp v0.25.0
+	github.com/emersion/go-smtp v0.26.0
 	github.com/evanw/esbuild v0.28.2
 	github.com/fyne-io/image v0.1.1
 	github.com/goccy/go-yaml v1.19.2
-	github.com/godwit-email/mailservers v0.20261106.1793937071
+	github.com/godwit-email/mailservers v0.20261123.1795438596
 	github.com/godwit-email/markitdown-go v0.0.0
 	github.com/google/jsonschema-go v0.4.3
 	github.com/gorilla/css v1.0.1
@@ -23,16 +23,18 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/stretchr/testify v1.12.1
-	github.com/tdewolff/parse/v2 v2.8.20
+	github.com/tdewolff/parse/v2 v2.25.0
 	github.com/zalando/go-keyring v0.2.8
-	golang.org/x/image v0.47.0
-	golang.org/x/net v0.62.0
-	golang.org/x/oauth2 v0.37.0
-	golang.org/x/sys v0.49.0
-	golang.org/x/text v0.43.0
+	golang.org/x/crypto v0.59.0
+	golang.org/x/image v0.48.0
+	golang.org/x/net v0.63.0
+	golang.org/x/oauth2 v0.38.0
+	golang.org/x/sys v0.50.0
+	golang.org/x/text v0.44.0
 )
 
 require (
+	github.com/MoeForge/moego v0.1.0-alpha.3 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
 	github.com/danieljoos/wincred v1.2.3 // indirect
 	github.com/extrame/ole2 v0.0.0-20160812065207-d69429661ad7 // indirect
@@ -51,8 +53,7 @@ require (
 	github.com/xuri/nfp v0.0.1 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/crypto v0.58.0 // indirect
-	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
 
